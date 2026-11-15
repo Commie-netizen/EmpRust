@@ -235,3 +235,41 @@ def test_oversized_anchor_proof_is_not_decoded(exported):
     edit_manifest(bundle, lambda m: m["anchors"][0].update(proof="A" * (2 << 20)))
     result = run(bundle)
     assert result.returncode == 1 and ("malformed" in result.stdout or "too large" in result.stdout)
+
+
+# --------------------------------------------------- fix round after the closing audit
+
+
+def test_the_bundle_root_is_pinned_once(exported, monkeypatch):  # N11
+    """The bundle directory itself is replaced by a link to an outside copy after the
+    verifier started: every later file must still come from the directory first opened."""
+    import os
+    bundle = copy(exported, "rootswap")
+    outside = bundle.parent / "outside-root"
+    shutil.copytree(bundle, outside)
+    item = sorted((bundle / "items").iterdir())[0]
+    item.write_bytes(b"not the licensed document")  # the real bundle is altered...
+    verifier = _load_verifier()  # ...while the outside copy still holds the genuine bytes
+    swapped = []
+    real_os_open = os.open
+
+    def os_open(path, *args, **kwargs):
+        if not swapped and "items" in str(path):
+            swapped.append(path)
+            bundle.rename(bundle.parent / "rootswap-real")
+            _link_directory(outside, bundle)
+        return real_os_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(verifier.os, "open", os_open)
+    report = verifier.verify(bundle, [])
+    monkeypatch.undo()
+    assert swapped
+    assert not report["ok"] and not report["items"][0].content_ok
+
+
+def test_duplicate_keys_in_a_manifest_are_refused(exported):  # review finding 7
+    bundle = copy(exported, "dupkey")
+    text = (bundle / "manifest.json").read_text(encoding="utf-8")
+    (bundle / "manifest.json").write_text('{"license_id": "x",' + text.lstrip()[1:], encoding="utf-8")
+    result = run(bundle)
+    assert result.returncode == 2 and "duplicate key" in result.stderr, result.stdout + result.stderr

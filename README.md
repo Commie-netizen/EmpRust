@@ -1,5 +1,22 @@
 # Empreinte
 
+## Moteur Rust et mémoire commune pour IA
+
+Le moteur Rust propose une mémoire locale multi-fournisseurs : imports JSON
+ChatGPT/Claude/format commun, synchronisation d'un dossier, recherche SQLite BM25,
+serveur MCP stdio et connexion à un modèle HTTP local compatible OpenAI.
+Voir [le guide local](docs/LOCAL_AI_MEMORY.md) et [le portage Rust](rust/README.md).
+Le [harness utilisateur](docs/USER_HARNESS.md) ajoute profils évolutifs, feedback,
+plans inspectables et appels HTTPS optionnels avec sélection des données et approbation.
+La base de conversations est distincte du coffre ci-dessous. Le mode SQLCipher
+est activé avec `--database-key-env` ; sans clé, la base reste en clair.
+
+```sh
+cargo build --manifest-path rust/Cargo.toml --locked --release
+cargo test --manifest-path rust/Cargo.toml --locked --all-targets
+python3 tools/test_memory_cli.py rust/target/release/empreinte
+```
+
 Archive personnelle chiffrée : fichiers versionnés, registre signé, graphe de
 liens, recherche et lots de divulgation pour des licences sélectives.
 L'interface est en français et servie localement.
@@ -44,8 +61,9 @@ pas à elle seule une date civile. Une date extérieure n'est présentée comme
 prouvée que si l'autorité d'horodatage est authentifiée. L'horodatage externe
 transmet une empreinte à un tiers et constitue une action séparée.
 
-Format et limites : `docs/FORMAT.md`. Reprise et validation du 14 novembre :
-`docs/reviews/2026-11-14-continuation.md`.
+Format et limites : `docs/FORMAT.md`. État courant, commandes et vérifications :
+`docs/CONTEXT.md`. Le dossier `rust/` contient un portage expérimental qui ne remplace
+pas la version Python.
 
 ## Coût du contexte
 

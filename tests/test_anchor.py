@@ -242,7 +242,8 @@ def vault(tmp_path, tsa):
 
 
 def reopen(path, tsa=None):
-    v = Vault.open(path, "pw")
+    # The fake authority is also the transport: a reopened vault must never fall back to HTTP.
+    v = Vault.open(path, "pw", transport=tsa, tsa_url="https://tsa.example/tsr" if tsa is not None else None)
     if tsa is not None:
         v.trust_roots = [tsa.root]
     return v
@@ -681,3 +682,63 @@ def test_old_cryptography_is_refused_with_a_clear_message(tmp_path):
     package = subprocess.run([sys.executable, "-c", "import empreinte.anchor"], capture_output=True, text=True,
                              env=env, cwd=tmp_path, timeout=60)
     assert package.returncode != 0 and "needs cryptography >= 49.0, found 44.0.3" in package.stderr
+
+
+# --------------------------------------------------- fix round after the closing audit
+
+
+def test_recovery_never_forgets_deleted_anchors(vault, tsa):  # N10
+    """A lagging catalog is replayed at open; that must not rewrite the anchor count
+    before the anchors were checked, or a second opening forgets the deletion."""
+    vault.anchor()
+    path = vault.path
+    lagging = (path / "catalog.bin").read_bytes()  # records 0..1, one anchor
+    vault.put("c.md", b"gamma")
+    vault.lock()
+    (path / "catalog.bin").write_bytes(lagging)  # as after a crash before the catalog write
+    (path / "anchors.jsonl").write_text("", encoding="utf-8")  # and the anchor deleted
+    for _ in range(2):
+        v = reopen(path, tsa)
+        try:
+            assert "anchors: the catalog knows 1, anchors.jsonl has 0" in v.verify().errors
+            with pytest.raises(VaultError, match="read-only"):
+                v.put("d.md", b"delta")
+        finally:
+            v.lock()
+
+
+def test_anchors_beyond_the_old_size_limit_stay_readable_and_writable(vault, tsa, monkeypatch):  # defect 7
+    import empreinte.vault as V
+
+    for _ in range(3):
+        vault.anchor()
+    path = vault.path
+    vault.lock()
+    size = (path / "anchors.jsonl").stat().st_size
+    monkeypatch.setattr(V, "MAX_ANCHORS_BYTES", size // 2)  # the file is now "long"
+    v = reopen(path, tsa)
+    try:
+        assert len(v.anchors()) == 3 and v.verify().ok, v.verify().errors
+        v.put("d.md", b"delta")
+        v.anchor()
+        assert len(v.anchors()) == 4
+    finally:
+        v.lock()
+
+
+def test_one_oversized_anchor_record_is_refused_without_reading_it(vault, tsa, monkeypatch):  # defect 7, N12
+    import empreinte.vault as V
+
+    vault.anchor()
+    path = vault.path
+    vault.lock()
+    first = (path / "anchors.jsonl").stat().st_size
+    with open(path / "anchors.jsonl", "ab") as handle:
+        handle.write(b'{"x":"' + b"A" * (first * 4) + b'"}\n')
+    monkeypatch.setattr(V, "MAX_ANCHOR_RECORD_BYTES", first + 100)
+    v = reopen(path, tsa)
+    try:
+        assert len(v.anchors()) == 1
+        assert any("anchors line 2" in e for e in v.verify().errors)
+    finally:
+        v.lock()

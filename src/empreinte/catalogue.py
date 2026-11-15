@@ -4,8 +4,8 @@ A catalogue lists, for each entry the owner chose: an opaque public id, the appr
 preview (summary and keywords), the word count and media type, the commitment of the
 exact version, its ledger record and, when an anchor covers it, the body digests that
 chain the record to that anchor plus the anchor token. Anyone can then check, with the
-standalone tools/verify_bundle.py and without the vault, that "this exact document,
-which I have not seen, existed no later than this date" and that the vault key signed
+standalone tools/verify_bundle.py and without the vault, whether a proven anchor
+establishes existence by its asserted date, and whether the vault key signed
 the list. Title, path and tags appear only when the owner ticks them per entry.
 
 What it cannot hide, and why (docs/FORMAT.md section 15 has the full note):
@@ -28,6 +28,7 @@ import hashlib
 import json
 import secrets
 import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -55,14 +56,23 @@ CATALOGUE_VERSION = 1
 SIGNATURE_PREFIX = b"empreinte/v1/catalogue\x00"
 PREVIEW_KEY = "preview/"  # same key as previews.make_preview and the server
 IDS_KEY = "catalogue/ids.v1"  # {"<entry_id>:<version>": public_id}
-PUBLISHED_KEY = "catalogue/published.v1"  # [CataloguePublication]
+PUBLISHED_KEY = "catalogue/published.v1"  # publications and recoverable {pending: publication} intents
 MAX_ENTRIES = 10_000
 STATEMENT = (
-    "This catalogue proves only that each listed document, identified by its commitment, was recorded "
-    "in the ledger of the vault whose public key is given, and, for an entry with an anchor, that it "
-    "existed no later than the time asserted by that timestamp authority. It shows none of the documents. "
+    "This catalogue proves a date only for an entry with a proven anchor. A claimed-only anchor "
+    "carries a claim by an authority that could not be authenticated. Without an anchor, an entry "
+    "proves nothing about dates yet. Summaries and keywords are owner assertions, not verified facts. "
+    "It shows none of the documents. "
     "It proves nothing about their quality or originality, nor about who wrote them beyond control of "
     "that key."
+)
+STATEMENT_FR = (
+    "Un catalogue ne prouve une date que pour une entrée avec une ancre prouvée. "
+    "Une ancre seulement déclarée porte une affirmation d'une autorité non authentifiée. "
+    "Sans ancre, une entrée ne prouve encore rien sur les dates. Les résumés et mots-clés sont des "
+    "déclarations du propriétaire, pas des faits vérifiés. Aucun document n'est inclus. "
+    "Le catalogue ne prouve ni la qualité, ni l'originalité, ni l'identité de l'auteur au-delà "
+    "du contrôle de la clé."
 )
 
 State = Literal["proven", "claimed", "none"]
@@ -143,7 +153,22 @@ def publications(vault: VaultAPI) -> list[CataloguePublication]:
     if not raw:
         return []
     try:
-        return [CataloguePublication.model_validate(p) for p in json.loads(raw.decode("utf-8"))]
+        result = []
+        for p in json.loads(raw.decode("utf-8")):
+            if isinstance(p, dict) and "pending" in p:
+                # Recoverable intent, promoted by the directory rename itself. An
+                # interrupted/failed export is never reported as a publication.
+                pub = CataloguePublication.model_validate(p["pending"])
+                try:
+                    data = (Path(pub.path) / "catalogue.json").read_bytes()
+                except OSError:
+                    continue
+                if hashlib.sha256(data).hexdigest() != pub.catalogue_hash:
+                    continue
+                result.append(pub)
+            else:
+                result.append(CataloguePublication.model_validate(p))
+        return result
     except (ValueError, ValidationError, TypeError):
         return []
 
@@ -260,23 +285,37 @@ def export(vault: VaultAPI, choices: Sequence[CatalogueChoice], out_dir: Path, *
     document["signature"] = sign(SIGNATURE_PREFIX + canonical(document)) if sign is not None else ""
     data = (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
-    target = Path(out_dir) / f"catalogue-{catalogue_id}"
-    target.mkdir(parents=True, exist_ok=False)
-    atomic_write(target / "catalogue.json", data)
-    for item in anchor_list:
-        atomic_write(target / PurePosixPath(item["file"]), base64.b64decode(item["proof"]))
-    atomic_write(target / "README.txt", _readme(document).encode("utf-8"))
-    verifier = Path(__file__).resolve().parents[2] / "tools" / "verify_bundle.py"
-    if verifier.is_file():
-        shutil.copyfile(verifier, target / "verify_bundle.py")
-
+    target = Path(out_dir).resolve() / f"catalogue-{catalogue_id}"
     publication = CataloguePublication(catalogue_id=catalogue_id, exported_at=exported_at, path=str(target),
                                        catalogue_hash=hashlib.sha256(data).hexdigest(), entries=published)
-    if ids_changed:
-        vault.aux_put(IDS_KEY, json.dumps(ids).encode("utf-8"))
-    history = publications(vault) + [publication]
-    vault.aux_put(PUBLISHED_KEY, json.dumps([p.model_dump(mode="json") for p in history],
-                                            ensure_ascii=False).encode("utf-8"))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    old_history = vault.aux_get(PUBLISHED_KEY) or b"[]"
+    staging = Path(tempfile.mkdtemp(prefix=".catalogue-", dir=target.parent))
+    recorded = False
+    try:
+        atomic_write(staging / "catalogue.json", data)
+        for item in anchor_list:
+            atomic_write(staging / PurePosixPath(item["file"]), base64.b64decode(item["proof"]))
+        atomic_write(staging / "README.txt", _readme(document).encode("utf-8"))
+        verifier = Path(__file__).resolve().parents[2] / "tools" / "verify_bundle.py"
+        if verifier.is_file():
+            shutil.copyfile(verifier, staging / "verify_bundle.py")
+        if ids_changed:
+            vault.aux_put(IDS_KEY, json.dumps(ids).encode("utf-8"))
+        history = [p.model_dump(mode="json") for p in publications(vault)]
+        history.append({"pending": publication.model_dump(mode="json")})
+        vault.aux_put(PUBLISHED_KEY, json.dumps(history, ensure_ascii=False).encode("utf-8"))
+        recorded = True
+        staging.rename(target)
+    except BaseException:
+        # Cleanup precedes rollback, so even a second storage failure cannot leave
+        # a verifying directory. The pending envelope is inert without the target.
+        if staging.resolve().parent != target.parent:
+            raise VaultError("catalogue staging directory moved outside its destination")
+        shutil.rmtree(staging)
+        if recorded:
+            vault.aux_put(PUBLISHED_KEY, old_history)
+        raise
     return publication
 
 
@@ -292,6 +331,12 @@ def _best_anchor(anchors: Sequence[AssessedAnchor], seq: int) -> tuple[int, Asse
 
 def _readme(document: dict) -> str:
     lines = [
+        "Catalogue public Empreinte",
+        STATEMENT_FR,
+        "Vérification : python verify_bundle.py --catalogue .",
+        "Après une licence : python verify_bundle.py BUNDLE_DIR --catalogue catalogue.json",
+        "Utilisez votre propre vérificateur et comparez la clé avec celle publiée par l'auteur.",
+        "",
         "Empreinte public catalogue",
         "",
         f"Catalogue {document['catalogue_id']}, vault public key (Ed25519) {document['public_key'] or '(none)'}.",

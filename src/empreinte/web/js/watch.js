@@ -35,7 +35,7 @@ export function renderWatch(summary, featureOn) {
     const name = baseName(f.path) + (f.prefix ? `  (${f.prefix}/)` : "");
     list.appendChild(h("li", {},
       h("span", { class: "watch-path", title: f.path, text: name }),
-      f.error ? h("span", { class: "watch-error", title: f.error, text: "illisible" }) : null,
+      f.error ? h("span", { class: "watch-error", title: f.error, text: f.enabled === false ? "désactivé" : "illisible" }) : null,
       h("button", { class: "link-btn", "aria-label": `Ne plus suivre ${f.path}`, text: "retirer",
         on: { click: () => removeFolder(f.path) } })));
   }
@@ -43,9 +43,11 @@ export function renderWatch(summary, featureOn) {
   if (!summary.folders.length) text = "Aucun dossier suivi.";
   else if (summary.last_capture) text = `Dernière capture : ${fmtDateTime(summary.last_capture)}`;
   else text = "Aucune capture depuis l'ouverture.";
-  if (summary.pending) text += ` ${summary.pending} fichier${summary.pending > 1 ? "s" : ""} en attente de ${Math.round(summary.quiet)} s sans modification.`;
+  if (summary.pending) text += ` ${summary.pending} fichier${summary.pending > 1 ? "s" : ""} en attente de capture.`;
+  if (summary.files_waiting) text += ` ${summary.files_waiting} en attente des prochains passages (budget de capture).`;
+  if (summary.skipped && summary.skipped.length) text += ` ${summary.skipped.length} fichier(s) ignoré(s) temporairement, nouvelle tentative différée.`;
   $("#watch-last").textContent = text;
-  $("#watch-last").title = summary.last_error || "";
+  $("#watch-last").title = (summary.skipped || []).map((s) => `${s.path} : ${s.reason}`).join("\n") || summary.last_error || "";
   if (lastCaptures !== null && summary.captures > lastCaptures) onCapture();
   lastCaptures = summary.captures;
 }

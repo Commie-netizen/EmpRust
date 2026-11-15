@@ -8,6 +8,7 @@
 
 const MAX_DEPTH = 12;
 const MAX_INPUT = 2_000_000;
+const MAX_TABLE_COLUMNS = 64;
 
 export const ALLOWED_TAGS = new Set([
   "h1", "h2", "h3", "h4", "h5", "h6", "p", "em", "strong", "del", "code", "pre", "ul", "ol", "li",
@@ -127,7 +128,11 @@ function parseBlocks(lines, depth) {
       continue;
     }
     if (line.includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1])) {
-      const header = splitRow(line);
+      // Columns are capped: every row is padded to the header width, so a wide header
+      // over many short rows would otherwise multiply into millions of cells.
+      const full = splitRow(line);
+      const omitted = full.length - MAX_TABLE_COLUMNS;
+      const header = omitted > 0 ? full.slice(0, MAX_TABLE_COLUMNS) : full;
       const aligns = splitRow(lines[i + 1]).map((c) => {
         const l = c.startsWith(":"), r = c.endsWith(":");
         return l && r ? "al-center" : r ? "al-right" : l ? "al-left" : null;
@@ -140,6 +145,7 @@ function parseBlocks(lines, depth) {
         el("thead", {}, [el("tr", {}, header.map((c, k) => cell("th", c, k)))]),
         el("tbody", {}, rows.map((r) => el("tr", {}, header.map((_, k) => cell("td", r[k] || "", k))))),
       ]));
+      if (omitted > 0) out.push(el("p", {}, [`(${omitted} colonnes omises au-delà de ${MAX_TABLE_COLUMNS})`]));
       continue;
     }
     m = RE_LIST.exec(line);

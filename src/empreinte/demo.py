@@ -104,7 +104,7 @@ class StubWorkspace:
     def close(self) -> None:
         """Drop every plaintext held here; later calls raise VaultError."""
         self._closed = True
-        for name in ("_meta", "_text", "_parsed", "_out", "_back", "_targets"):
+        for name in ("_meta", "_text", "_parsed", "_out", "_back", "_targets", "_names"):
             value = getattr(self, name, None)
             if hasattr(value, "clear"):
                 value.clear()
@@ -143,6 +143,7 @@ class StubWorkspace:
             keys = {path, path.rsplit(".", 1)[0], stem, stem.rsplit(".", 1)[0], meta.title.lower()}
             for key in keys:
                 names[key].append(entry_id)
+        self._names = names  # kept to resolve the links of historical versions
         self._out: dict[str, list[str]] = {}
         self._back: dict[str, list[str]] = defaultdict(list)
         self._targets: dict[str, dict[str, str]] = {}
@@ -171,9 +172,18 @@ class StubWorkspace:
         if entry_id not in self._meta:
             raise NotFound(entry_id)
 
-    def link_targets(self, entry_id: str) -> dict[str, str]:
+    def link_targets(self, entry_id: str, version: int | None = None) -> dict[str, str]:
         self._known(entry_id)
-        return dict(self._targets.get(entry_id, {}))
+        meta = self._meta[entry_id]
+        if version is None or version == meta.n_versions:
+            return dict(self._targets.get(entry_id, {}))
+        parsed = parse_text(self.text(entry_id, version), meta.title, meta.tags)
+        resolved = {}
+        for raw in (*parsed.links, *parsed.embeds):
+            target = self._resolve(raw, meta.path, self._names)
+            if target is not None:
+                resolved[raw] = target
+        return resolved
 
     def parsed(self, entry_id: str) -> ParsedDoc:
         self._known(entry_id)
@@ -680,9 +690,12 @@ def demo_session(*, fresh: bool = False):
     def exists() -> bool:
         return state["vault"] is not None
 
-    def open_vault(passphrase: str):
+    def check_passphrase(passphrase: str) -> None:
         if state["vault"] is None or not secrets.compare_digest(passphrase.encode(), state["passphrase"].encode()):
             raise WrongPassphrase("phrase de passe incorrecte")
+
+    def open_vault(passphrase: str):
+        check_passphrase(passphrase)
         state["vault"].reopen()
         return state["vault"], StubWorkspace(state["vault"])
 
@@ -698,5 +711,6 @@ def demo_session(*, fresh: bool = False):
         return [make_preview(vault, e) for e in entry_ids]
 
     # No import_folder: the demo passphrase is public, so the demo never reads real files.
-    return Session(open_vault=open_vault, create_vault=create_vault, exists=exists, import_folder=None,
+    return Session(open_vault=open_vault, check_passphrase=check_passphrase, create_vault=create_vault,
+                   exists=exists, import_folder=None,
                    make_previews=make_previews, export_dir=export_dir, demo=True)

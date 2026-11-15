@@ -49,3 +49,27 @@ def test_status_reports_coverage_only_to_the_unlocked_page(tmp_path):
         assert coverage["n_records"] == 1 and coverage["uncovered"] == 1 and coverage["oldest_uncovered_at"]
     finally:
         h.close()
+
+
+# --------------------------------------------------- review of capture and catalogue, finding 3
+
+
+def test_coverage_cache_follows_the_trust_roots_content_and_the_anchors(tmp_path):
+    tsa = FakeTSA()
+    v = Vault.create(tmp_path / "v", "pw", clock=stepping_clock(), kdf_params=crypto.TEST_KDF, transport=tsa)
+    try:
+        v.trust_roots = [tsa.root]
+        v.put("a.md", b"a")
+        v.anchor()
+        assert v.coverage().uncovered == 0
+        v.trust_roots.clear()  # emptied in place: same list object
+        assert v.coverage().covered_upto == -1, "a root removed in place must not keep proving"
+        v.trust_roots.append(tsa.root)
+        assert v.coverage().covered_upto == 0
+        (v.path / "anchors.jsonl").write_text("", encoding="utf-8")  # the anchors vanish on disk
+        report = v.verify()
+        assert not report.ok
+        c = v.coverage()
+        assert c.covered_upto == -1 and c.uncovered == 1, "after a discrepancy nothing is vouched for"
+    finally:
+        v.lock()

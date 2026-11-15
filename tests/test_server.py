@@ -106,6 +106,10 @@ def session_and_state(vault, *, exists=True, with_extras=True, export_dir: Path 
         state["vault"].reopen()
         return state["vault"], new_ws(state["vault"])
 
+    def check_passphrase(passphrase):
+        if passphrase != state["pass"] or state["vault"] is None:
+            raise WrongPassphrase("non")
+
     def create_vault(passphrase):
         state["vault"] = make_vault()
         state["pass"] = passphrase
@@ -118,7 +122,7 @@ def session_and_state(vault, *, exists=True, with_extras=True, export_dir: Path 
     def previews(v, ws, ids):
         return [make_preview(v, i) for i in ids]
 
-    return Session(open_vault=open_vault, create_vault=create_vault,
+    return Session(open_vault=open_vault, create_vault=create_vault, check_passphrase=check_passphrase,
                    exists=lambda: state["vault"] is not None if not exists else True,
                    import_folder=import_folder if with_extras else None,
                    make_previews=previews if with_extras else None,
@@ -1106,3 +1110,171 @@ def test_proof_and_verify_pass_anchor_status_through():  # a, new defect 9
     finally:
         h.close()
         shutil.rmtree(session.export_dir, ignore_errors=True)
+
+
+# --------------------------------------------------- fix round after the closing audit
+
+
+def test_a_lock_is_not_undone_by_an_unlock_waiting_for_its_turn():  # closing audit, defect 2
+    import threading
+
+    vault = make_vault()
+    h = Harness(session_for(vault), vault)
+    try:
+        h.unlock()
+        token_a = h.unlock_token
+        app = h.server.app
+        app.auth_lock.acquire()  # another passphrase attempt is being checked
+        try:
+            worker, result = _unlock_in_background(h)
+            time.sleep(0.3)  # the new attempt has arrived and waits for its turn
+            assert h.call("POST", "/api/lock", {}, headers={"X-Empreinte-Unlock": token_a})[0] == 200
+        finally:
+            app.auth_lock.release()
+        worker.join(5)
+        status, body, _ = result["r"]
+        assert status == 409 and body["error"] == "locked_meanwhile"
+        assert app.active is None  # the owner's lock stands
+        assert h.call("GET", "/api/status")[1]["unlocked"] is False
+    finally:
+        h.close()
+
+
+def test_a_wrong_passphrase_does_not_close_the_open_session():  # closing audit, defect 4
+    vault = make_vault()
+    h = Harness(session_for(vault), vault)
+    try:
+        h.unlock()
+        token_a = h.unlock_token
+        status, body, _ = h.call("POST", "/api/unlock", {"passphrase": "wrong one"}, unlock=False)
+        assert status == 401 and body["error"] == "wrong_passphrase"
+        status, _, _ = h.call("GET", "/api/entries", headers={"X-Empreinte-Unlock": token_a})
+        assert status == 200
+        assert h.server.app.active is not None and h.server.app.active.token == token_a
+    finally:
+        h.close()
+
+
+def test_second_unlock_of_a_real_vault_authenticates_then_hands_over_the_writer(tmp_path):
+    from empreinte import crypto
+    from empreinte.cli import session_for as real_session
+
+    session = real_session(tmp_path / "coffre", kdf_params=crypto.TEST_KDF)
+    h = Harness(session, None)
+    try:
+        status, body, _ = h.call("POST", "/api/create", {"passphrase": "une phrase assez longue"})
+        assert status == 200
+        first = body["unlock_token"]
+        status, _, _ = h.call("POST", "/api/unlock", {"passphrase": "pas la bonne phrase"}, unlock=False)
+        assert status == 401
+        assert h.call("GET", "/api/entries", headers={"X-Empreinte-Unlock": first})[0] == 200
+        assert h.unlock("une phrase assez longue")[0] == 200 and h.unlock_token != first
+        assert not getattr(h.server.app.active.vault, "held_by_another_writer")  # the writer moved over
+        assert h.call("GET", "/api/entries", headers={"X-Empreinte-Unlock": first})[0] == 401
+    finally:
+        h.close()
+
+
+def test_a_preview_of_an_older_version_is_refused_at_commit():  # closing audit, defect 3
+    import threading
+
+    vault = make_vault()
+    session, state = session_and_state(vault)
+    gate, entered, slow = threading.Event(), threading.Event(), {"on": True}
+    original = session.make_previews
+
+    def held(v, ws, ids_):
+        result = original(v, ws, ids_)  # generated for the version current now (v1 below)
+        if slow["on"]:
+            slow["on"] = False
+            entered.set()
+            gate.wait(5)
+        return result
+
+    session.make_previews = held
+    h = Harness(session, vault)
+    try:
+        h.unlock()
+        plan = ids(h)["Projets/Plan.md"]
+        result: dict = {}
+        worker = threading.Thread(target=lambda: result.update(r=h.call("POST", "/api/previews", {"entry_ids": [plan]})))
+        worker.start()
+        assert entered.wait(5)
+        vault.put("Projets/Plan.md", b"# Plan\n\nUne nouvelle version du plan, sur un autre sujet.")
+        status, newer, _ = h.call("POST", "/api/previews", {"entry_ids": [plan]})
+        assert status == 200 and newer[0]["version"] == 2
+        assert h.call("POST", f"/api/previews/{plan}/approve", {"digest": newer[0]["digest"]})[0] == 200
+        gate.set()
+        worker.join(5)
+        status, body, _ = result["r"]
+        assert status == 409 and body["error"] == "stale"
+        stored = h.call("GET", f"/api/previews/{plan}")[1]
+        assert stored["version"] == 2 and stored["approved"] and stored["current"]
+    finally:
+        gate.set()
+        h.close()
+
+
+def test_anchoring_does_not_hold_the_operation_lock():  # closing audit, server.py anchor call
+    import threading
+
+    gate, entered = threading.Event(), threading.Event()
+
+    class SlowAnchor(ReopenableVault):
+        def anchor_methods(self):
+            return ["rfc3161"]
+
+        def anchor(self, method="rfc3161"):
+            entered.set()
+            gate.wait(5)  # the authority is slow to answer
+            if self._locked:
+                raise VaultError("the vault was locked during the timestamp request; the anchor is not stored")
+            raise VaultError("refusé par le test")
+
+    from empreinte.api import VaultError
+
+    vault = SlowAnchor(clock=stepping_clock())
+    vault.put("a.md", b"# A")
+    h = Harness(session_for(vault), vault)
+    try:
+        h.unlock()
+        result: dict = {}
+        worker = threading.Thread(target=lambda: result.update(
+            r=h.call("POST", "/api/anchor", {"method": "rfc3161", "confirm": True})))
+        worker.start()
+        assert entered.wait(5)
+        started = time.monotonic()
+        assert h.call("GET", "/api/entries")[0] == 200
+        assert h.call("POST", "/api/lock", {})[0] == 200
+        assert time.monotonic() - started < 1
+        gate.set()
+        worker.join(5)
+        status, body, _ = result["r"]
+        assert status == 409 and "locked" in body["message"]
+    finally:
+        gate.set()
+        h.close()
+
+
+@pytest.mark.parametrize("length", ["9" * 5000, "²", "12 3", "-1", "+5"])
+def test_an_absurd_content_length_gets_a_structured_400(srv, length):  # j
+    sock = socket.create_connection(("127.0.0.1", srv.port), timeout=5)
+    sock.sendall((f"POST /api/unlock HTTP/1.1\r\nHost: {srv.host}\r\nX-Empreinte-Token: {srv.token}\r\n"
+                  f"Origin: {srv.origin}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\n\r\n"
+                  ).encode("utf-8"))
+    reply = _read_all(sock)
+    head, _, body = reply.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 400"), reply[:200]
+    assert json.loads(body)["error"] == "invalid"
+
+
+def test_historical_text_comes_with_its_own_link_targets(open_srv):  # closing audit c, defect 9
+    vault = open_srv.vault
+    target = vault.find("Projets/Plan.md").entry_id
+    note = vault.put("Historique.md", b"Voir [[Plan]].")
+    vault.put("Historique.md", b"Le lien a disparu.")
+    open_srv.server.app.active.workspace.refresh()
+    first = open_srv.call("GET", f"/api/entries/{note.entry_id}/text?version=1")[1]
+    latest = open_srv.call("GET", f"/api/entries/{note.entry_id}/text")[1]
+    assert first["link_targets"] == {"Plan": target}
+    assert latest["link_targets"] == {}

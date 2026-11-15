@@ -208,8 +208,9 @@ def test_add_folder_refuses_overlaps_duplicates_and_shared_prefixes(vault, tmp_p
         add_folder(vault, a)
     with pytest.raises(ValueError, match="dossier logique"):
         add_folder(vault, b)  # same (empty) prefix: same logical paths
-    assert [f.prefix for f in add_folder(vault, b, "Autre")] == ["", "Autre"]
-    assert [f.path for f in remove_folder(vault, a)] == [str(b.resolve())]
+    with pytest.raises(ValueError, match="dossier logique"):
+        add_folder(vault, b, "Autre")
+    assert remove_folder(vault, a) == []
     with pytest.raises(ValueError):
         remove_folder(vault, a)
 
@@ -376,3 +377,203 @@ def test_watch_routes_need_the_feature_and_the_unlock_token(tmp_path):
         assert h.call("GET", "/api/watch")[0] == 404
     finally:
         h.close()
+
+
+# --------------------------------------------------- fix round after the closing audit
+
+
+def test_an_unreadable_file_is_retried_with_back_off(vault, tmp_path, monkeypatch):  # closing audit
+    clock, folder = Clock(), tmp_path / "notes"
+    folder.mkdir()
+    w = watcher_for(vault, folder, clock)
+    write(folder / "verrou.md", "# Verrouillé", clock.now - 3600)
+    attempts = []
+
+    def unreadable(root, source, max_bytes):
+        attempts.append(clock.now)
+        raise PermissionError("accès refusé")
+
+    monkeypatch.setattr(watch, "read_source", unreadable)
+    for _ in range(3600):  # one hour of polls, one per second
+        w.poll(vault)
+        clock.advance(1)
+    assert 3 <= len(attempts) <= 12, len(attempts)  # not one read per quiet period forever
+    gaps = [b - a for a, b in zip(attempts, attempts[1:])]
+    assert gaps == sorted(gaps)  # the wait grows
+    assert "verrou.md" in w.summary()["last_error"]
+    monkeypatch.undo()
+    write(folder / "verrou.md", "# Lisible", clock.now - 120)  # the file changed: no back-off any more
+    [capture] = w.poll(vault)
+    assert capture.path == "verrou.md"
+
+
+@pytest.mark.parametrize("batch_files,batch_bytes,poll_files,poll_bytes", [
+    (2, 8, 5, 20), (3, 8, 7, 20), (2, 100, 5, 100),
+])
+def test_review_1_bounded_batches_and_poll(vault, tmp_path, monkeypatch,
+                                         batch_files, batch_bytes, poll_files, poll_bytes):
+    clock, folder = Clock(), tmp_path / "bounded"
+    for i in range(7):
+        write(folder / f"{i}.md", "1234", clock.now - 100)
+    w = watcher_for(vault, folder, clock)
+    monkeypatch.setattr(watch, "MAX_BATCH_FILES", batch_files, raising=False)
+    monkeypatch.setattr(watch, "MAX_BATCH_BYTES", batch_bytes, raising=False)
+    monkeypatch.setattr(watch, "MAX_POLL_FILES", poll_files, raising=False)
+    monkeypatch.setattr(watch, "MAX_POLL_BYTES", poll_bytes, raising=False)
+    sizes = []
+    original = w.commit
+    def commit(v, ready):
+        sizes.append((len(ready), sum(len(r.content) for r in ready)))
+        return original(v, ready)
+    monkeypatch.setattr(w, "commit", commit)
+    assert len(w.poll(vault)) == 5
+    assert sizes == [(2, 8), (2, 8), (1, 4)]
+    assert w.summary()["files_waiting"] == 2
+    assert len(w.poll(vault)) == 2
+
+
+def test_review_2_saved_forbidden_watch_disabled(vault):
+    watch.save_folders(vault, [watch.WatchedFolder(str(vault.path))])
+    w = Watcher()
+    w.load(vault)
+    assert w.scan() == []
+    assert w.summary()["folders"][0]["enabled"] is False
+    assert "archive" in w.summary()["folders"][0]["error"]
+
+
+@pytest.mark.parametrize("change", ["removed", "source", "entry", "readded"])
+def test_review_5_obsolete_ready(vault, tmp_path, change):
+    clock, folder = Clock(), tmp_path / "queued"
+    write(folder / "a.md", "old", clock.now - 100)
+    w = watcher_for(vault, folder, clock)
+    ready = w.read(w.scan())
+    if change in {"removed", "readded"}:
+        w.set_folders(vault, remove_folder(vault, folder))
+        if change == "readded":
+            w.set_folders(vault, add_folder(vault, folder))
+    elif change == "source":
+        write(folder / "a.md", "newer source", clock.now)
+    else:
+        vault.put("a.md", b"manual import")
+    assert w.commit(vault, ready) == []
+    assert puts(vault) == (1 if change == "entry" else 0)
+
+
+@pytest.mark.parametrize("a,b", [("", "Work"), ("Work", "work/sub"), ("Work/sub", "WORK"), ("Work", "WORK")])
+def test_review_6_prefix_overlap(vault, tmp_path, a, b):
+    left, right = tmp_path / "left", tmp_path / "right"
+    left.mkdir(); right.mkdir()
+    add_folder(vault, left, a)
+    with pytest.raises(ValueError, match="dossier logique"):
+        add_folder(vault, right, b)
+
+
+def test_review_10_unreadable_subtree_keeps_state(vault, tmp_path, monkeypatch):
+    clock, folder = Clock(), tmp_path / "scan"
+    write(folder / "sub" / "a.md", "a", clock.now - 100)
+    w = watcher_for(vault, folder, clock)
+    w.poll(vault)
+    before = dict(w._states[w.folders[0]].known)
+    original = Path.iterdir
+    def denied(path):
+        if path == folder / "sub":
+            raise PermissionError("denied subtree")
+        return original(path)
+    monkeypatch.setattr(Path, "iterdir", denied)
+    assert w.poll(vault) == []
+    assert "denied subtree" in w.summary()["folders"][0]["error"]
+    assert w._states[w.folders[0]].known == before
+
+
+def test_extra_skipped_once_and_immediate_changed_retry(vault, tmp_path, monkeypatch):
+    clock, folder = Clock(), tmp_path / "retry"
+    write(folder / "a.md", "a", clock.now - 100)
+    w = watcher_for(vault, folder, clock)
+    real = watch.read_source
+    monkeypatch.setattr(watch, "read_source", lambda *args: (_ for _ in ()).throw(PermissionError("denied")))
+    w.poll(vault)
+    clock.advance(61)
+    w.poll(vault)
+    assert len(w.summary()["skipped"]) == 1
+    assert "denied" in w.summary()["skipped"][0]["reason"]
+    monkeypatch.setattr(watch, "read_source", real)
+    write(folder / "a.md", "changed", clock.now)
+    assert len(w.poll(vault)) == 1
+    assert w.summary()["skipped"] == []
+
+
+def test_extra_backoff_reaches_ceiling(vault, tmp_path, monkeypatch):
+    clock, folder = Clock(), tmp_path / "ceiling"
+    write(folder / "a.md", "a", clock.now - 100)
+    w = watcher_for(vault, folder, clock)
+    attempts = []
+    def denied(*args):
+        attempts.append(clock.now)
+        raise PermissionError("denied")
+    monkeypatch.setattr(watch, "MAX_BACKOFF", 120)
+    monkeypatch.setattr(watch, "read_source", denied)
+    for _ in range(421):
+        w.poll(vault)
+        clock.advance(1)
+    assert [b - a for a, b in zip(attempts, attempts[1:])] == [60, 120, 120, 120]
+    assert len(w.summary()["skipped"]) == 1
+
+
+@pytest.mark.parametrize("end", ["stop", "stale"])
+def test_review_1_thread_releases_lock_and_checks_session_between_batches(vault, tmp_path, monkeypatch, end):
+    clock, folder = Clock(), tmp_path / "thread"
+    for i in range(5):
+        write(folder / f"{i}.md", "data", clock.now - 100)
+    w = watcher_for(vault, folder, clock)
+    w.interval = 0
+    monkeypatch.setattr(watch, "MAX_BATCH_FILES", 2)
+    committed, reads = [], []
+    real_read = w.read
+    def read(due):
+        reads.append(len(due))
+        return real_read(due)
+    monkeypatch.setattr(w, "read", read)
+    def locked(fn):
+        if committed and end == "stale":
+            raise watch.Stale()
+        return fn(vault)
+    def captured(v, captures):
+        committed.extend(captures)
+        if end == "stop":
+            thread.stop()
+    thread = watch.WatchThread(w, locked, captured)
+    thread.run()
+    assert len(committed) == 2 and reads == [2] and puts(vault) == 2
+
+
+def test_review_2_scanner_never_descends_into_exclusions(tmp_path, monkeypatch):
+    clock = Clock()
+    for name in ("vault", "exports", "notes"):
+        write(tmp_path / name / "a.md", "data", clock.now)
+    forbidden = (tmp_path / "vault", tmp_path / "exports")
+    original = Path.iterdir
+    def checked(path):
+        assert path not in forbidden, "scanner descended into an exclusion"
+        return original(path)
+    monkeypatch.setattr(Path, "iterdir", checked)
+    assert [s.relative_path for s in watch._scan(tmp_path, forbidden)] == ["notes/a.md"]
+
+
+def test_review_2_saved_parent_and_export_are_disabled(vault):
+    export = vault.path.parent / f"{vault.path.name}-licences"
+    watch.save_folders(vault, [watch.WatchedFolder(str(vault.path.parent), "parent"),
+                              watch.WatchedFolder(str(export), "exports")])
+    folders = load_folders(vault)
+    assert len(folders) == 2 and all(f.disabled_reason for f in folders)
+
+
+def test_review_10_vanished_root_retains_known(vault, tmp_path):
+    clock, folder = Clock(), tmp_path / "vanish"
+    write(folder / "a.md", "data", clock.now - 100)
+    w = watcher_for(vault, folder, clock)
+    w.poll(vault)
+    before = dict(w._states[w.folders[0]].known)
+    folder.rename(tmp_path / "moved")
+    assert w.poll(vault) == []
+    assert "illisible" in w.summary()["folders"][0]["error"]
+    assert w._states[w.folders[0]].known == before

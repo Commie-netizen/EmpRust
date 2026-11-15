@@ -63,13 +63,14 @@ export async function renderLedger(root) {
   }
 
   const coverageSlot = h("div", { "aria-live": "polite" });
+  showCoverageIn(coverageSlot);  // refreshed by updateCoverage on every status answer
   const anchorsSlot = h("div");
   const tableSlot = h("div");
   inner.append(h("h2", { text: "Ancres externes" }), coverageSlot, anchorsSlot, h("h2", { text: "Enregistrements" }), tableSlot);
 
   try {
     const s = await get("/api/status");
-    if (s.coverage) coverageSlot.appendChild(coverageCard(s.coverage));
+    updateCoverage(s.coverage);
   } catch (err) { if (ended(err)) return; }
   try {
     const anchors = await get("/api/anchors");
@@ -85,6 +86,21 @@ export async function renderLedger(root) {
   } catch (err) { if (ended(err)) return; anchorsSlot.appendChild(h("p", { class: "error", text: err.message })); }
   await renderPage(tableSlot);
 }
+
+let shownCoverage = null;  // the coverage slot of the Registre view, while it is displayed
+
+/** Repaint the coverage card of the Registre, if it is on screen, from a status answer
+ * (the status poll, a capture, an anchor): it never shows a stale "Tout est couvert". */
+export function updateCoverage(coverage) {
+  if (!shownCoverage || !shownCoverage.isConnected) { shownCoverage = null; return; }
+  clear(shownCoverage);
+  if (coverage) shownCoverage.appendChild(coverageCard(coverage));
+}
+
+export function showCoverageIn(slot) { shownCoverage = slot; }
+
+/** Forget the card on lock (its content is cleared with the view). */
+export function resetCoverage() { shownCoverage = null; }
 
 /** How many records no proven anchor covers yet, and since when the oldest waits. */
 export function coverageCard(c) {

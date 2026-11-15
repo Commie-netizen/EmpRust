@@ -213,10 +213,13 @@ class WorkspaceAPI(Protocol):
         the vault locks. Every later call raises VaultError."""
         ...
 
-    def link_targets(self, entry_id: str) -> dict[str, str]:
+    def link_targets(self, entry_id: str, version: int | None = None) -> dict[str, str]:
         """Raw link and embed targets of this entry that resolve, mapped to the entry_id
         they resolve to. The one place links are resolved: the interface uses this map and
-        never resolves a link itself."""
+        never resolves a link itself.
+
+        `version` (None: the latest) names the text whose links are listed, so a historical
+        version shows its own links, resolved against the entries as they are now."""
         ...
 
     def outlinks(self, entry_id: str) -> list[str]: ...

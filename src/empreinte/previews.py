@@ -6,6 +6,7 @@ therefore needs the owner's approval before disclosure.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
@@ -15,7 +16,7 @@ from .api import VaultAPI, WorkspaceAPI
 from .context import compact_context, preview_cache_policy
 from .localllm import LLMError, LocalLLMClient, complete_json
 from .model import Preview
-from .parse import count_words, is_text, parse_document
+from .parse import _CJK, count_words, is_text, parse_document
 from .pii import scrub
 from .search import fold
 
@@ -40,8 +41,32 @@ class _Teaser(BaseModel):
     keywords: list[str] = Field(min_length=3, max_length=8)
 
 
+# Ideographic and syllabic scripts are written without spaces: each character is one
+# token, so copying a sentence is seen as a run of shared tokens, not as one long word.
+_CJK_ALL = _CJK + r"\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af"
+_TOKENS = re.compile(rf"[{_CJK_ALL}]|[^\W_{_CJK_ALL}]+")
+# Hyphens, soft hyphens and invisible joiners inserted inside a word ("co-balt") are
+# removed on both sides before comparing, so they cannot hide a copied word.
+_JOINERS = re.compile(r"(?<=[^\W_])[-\u00ad\u2010\u2011\u2012\u2013\u200b\u200c\u200d\u2060\ufeff]+(?=[^\W_])")
+_DIGIT_GAPS = re.compile(r"(?<=\d)[\s.,\-/\u00a0\u202f']+(?=\d)")
+
+
+def _normal(text: str) -> str:
+    return fold(_JOINERS.sub("", text))
+
+
 def _words(text: str) -> list[str]:
-    return re.findall(r"[^\W_]+", fold(text))
+    return _TOKENS.findall(_normal(text))
+
+
+def _runs(text: str) -> list[str]:
+    """Words with each run of CJK characters kept whole (for keyword phrases)."""
+    return re.findall(r"[^\W_]+", _normal(text))
+
+
+def _digit_runs(text: str) -> list[str]:
+    """Runs of four or more digits, with spaces or separators inside a number removed."""
+    return re.findall(r"\d{4,}", _DIGIT_GAPS.sub("", fold(text)))
 
 
 def _grams(words: list[str], size: int) -> set[tuple[str, ...]]:
@@ -60,10 +85,16 @@ def _validate(teaser: _Teaser, document: str) -> tuple[str, list[str]]:
         raise ValueError("provide three to eight short distinct keywords")
     source_words = _words(document)
     source5, source4 = _grams(source_words, 5), _grams(source_words, 4)
+    source_runs = _runs(document)
     for keyword in keywords:
-        words = _words(keyword)
-        if len(words) >= 2 and tuple(words) in _grams(source_words, len(words)):
+        words = _runs(keyword)
+        if len(words) >= 2 and tuple(words) in _grams(source_runs, len(words)):
             raise ValueError("keyword repeats a distinctive document phrase")
+    # Codes, phone numbers, amounts: any four consecutive digits of the document.
+    source_digits = "|".join(_digit_runs(document))
+    for run in _digit_runs(" ".join([summary, *keywords])):
+        if any(run[i:i + 4] in source_digits for i in range(len(run) - 3)):
+            raise ValueError("teaser repeats a run of four or more digits from the document")
 
     def check(field: str) -> None:
         words = _words(field)
@@ -75,11 +106,13 @@ def _validate(teaser: _Teaser, document: str) -> tuple[str, list[str]]:
     # Four consecutive content words can be reassembled regardless of field/order.
     # Keep occurrences in source order, including repetitions; each window costs
     # at most four set lookups, independent of the number of keyword permutations.
+    # Multiplicity counts: a window repeating one word four times needs that word four
+    # times in the teaser, so a topic word repeated in the document can still be named.
     content_words = [word for word in source_words if word not in _FUNCTION_WORDS]
-    distinctive = set(content_words)
-    disclosed = distinctive.intersection(_words(" ".join([summary, *keywords])))
+    disclosed = Counter(word for word in _words(" ".join([summary, *keywords])) if word not in _FUNCTION_WORDS)
     for i in range(len(content_words) - 3):
-        if all(word in disclosed for word in content_words[i:i + 4]):
+        window = Counter(content_words[i:i + 4])
+        if all(disclosed[word] >= n for word, n in window.items()):
             raise ValueError("teaser copies too much document wording")
     # Conservatively regard every capitalized source token as a possible name.
     names = {fold(word) for word in re.findall(r"[^\W\d_]+", document) if len(word) > 1 and word[0].isupper()}

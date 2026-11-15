@@ -10,9 +10,10 @@ import { Timeline } from "./timeline.js";
 import { renderNote } from "./reader.js";
 import { renderActivity } from "./views/activity.js";
 import { renderSearch, focusSearch, resetSearch } from "./views/search.js";
-import { renderLedger } from "./views/ledger.js";
+import { renderLedger, updateCoverage, resetCoverage } from "./views/ledger.js";
 import { renderLicenses, resetLicenses } from "./views/licenses.js";
 import { renderWatch, resetWatch, onCaptured } from "./watch.js";
+import { readPrefs, runInitialisation } from "./startup.js";
 
 const VIEWS = ["graph", "reading", "activity", "search", "ledger", "licenses"];
 const RAIL_ICONS = { graph: "graph", reading: "reading", activity: "activity", search: "search", ledger: "ledger", licenses: "licenses" };
@@ -162,8 +163,7 @@ async function loadGraph(resetRange = false) {
 }
 
 async function loadPrefs() {
-  let prefs = {};
-  try { prefs = await get("/api/prefs"); } catch { prefs = {}; }
+  const prefs = await readPrefs(get);  // a lock while reading stops the initialisation
   const settings = { ...DEFAULT_SETTINGS };
   if (prefs && typeof prefs.graph === "object" && prefs.graph) {
     for (const [k, v] of Object.entries(prefs.graph)) {
@@ -195,20 +195,20 @@ async function enterApp() {
   $("#import-btn").hidden = !status.features.import;
   $("#vault-name").textContent = status.demo ? "Archive de démonstration" : "Archive";
   showView("graph");
-  try {
-    await loadPrefs();
-    await loadEntries();
-    untilIso = null;
-    await loadGraph(true);
-    graph.fit();
-    $("#graph-canvas").focus({ preventScroll: true });
-  } catch (err) {
-    if (!ended(err)) toast(err.message, true);
-  }
-  renderWatch(status.watch, status.features.watch);
-  clearInterval(poller);
-  // Status polls do not count as activity for the idle lock; faster while capture is on.
-  poller = setInterval(checkStatus, status.features.watch ? 5000 : 15000);
+  const entered = status;
+  // Each step is skipped, and nothing more is painted or started, once a lock happened.
+  await runInitialisation([
+    () => loadPrefs(),
+    () => loadEntries(),
+    async () => { untilIso = null; await loadGraph(true); },
+    () => { graph.fit(); $("#graph-canvas").focus({ preventScroll: true }); },
+  ], () => {
+    renderWatch(entered.watch, entered.features.watch);
+    updateCoverage(entered.coverage);
+    clearInterval(poller);
+    // Status polls do not count as activity for the idle lock; faster while capture is on.
+    poller = setInterval(checkStatus, entered.features.watch ? 5000 : 15000);
+  }, (err) => toast(err.message, true));
 }
 
 async function checkStatus() {
@@ -216,7 +216,8 @@ async function checkStatus() {
     const s = await get("/api/status");
     if ($("#app").hidden) return;
     if (!s.unlocked) { wipe("Archive verrouillée après une période d'inactivité."); return; }
-    renderWatch(s.watch, s.features.watch);
+    renderWatch(s.watch, s.features.watch);  // may report captures: views refresh (onCaptured)
+    updateCoverage(s.coverage);  // the Registre card follows captures and anchors
   } catch (err) {
     if (err.code === "bad_token" && !$("#app").hidden) wipe(RESTARTED);
   }
@@ -236,6 +237,7 @@ async function wipe(message, lockServer = false) {
   resetSearch();
   resetLicenses();
   resetWatch();
+  resetCoverage();
   graph.clear();
   renderLegend([]);
   graph.settings = { ...DEFAULT_SETTINGS, groups: [] };
@@ -268,8 +270,9 @@ const RESTARTED = "Le serveur local a redémarré : rechargez la page.";
 onLocked((err) => { if (!$("#app").hidden) wipe(err.code === "bad_token" ? RESTARTED : "Archive verrouillée."); });
 
 async function unlocked() {
-  status = await get("/api/status");
-  enterApp();
+  try { status = await get("/api/status"); }
+  catch (err) { if (!ended(err)) toast(err.message, true); return; }
+  await enterApp();
 }
 
 async function importFolder() {

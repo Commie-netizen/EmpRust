@@ -119,3 +119,23 @@ def test_markdown_extension_is_not_an_md_alias():
     graph = workspace.graph()
     assert graph.unresolved == 1
     assert [(e.source, e.target) for e in graph.edges] == [(source.entry_id, note.entry_id)]
+
+
+def test_link_targets_follow_the_displayed_version(tmp_path):  # closing audit c, defect 9
+    from empreinte import crypto
+    from empreinte.demo import StubWorkspace
+    from empreinte.testing import InMemoryVault, stepping_clock
+    from empreinte.vault import Vault
+    from empreinte.workspace import Workspace
+
+    real = Vault.create(tmp_path / "v", "pw", clock=stepping_clock(), kdf_params=crypto.TEST_KDF)
+    memory = InMemoryVault(clock=stepping_clock())
+    for vault, make in ((real, Workspace), (memory, StubWorkspace)):
+        target = vault.put("Cible.md", b"# Cible")
+        note = vault.put("Note.md", b"Voir [[Cible]].")
+        vault.put("Note.md", b"Plus de lien ici.")
+        ws = make(vault)
+        assert ws.link_targets(note.entry_id) == {}
+        assert ws.link_targets(note.entry_id, 1) == {"Cible": target.entry_id}
+        assert ws.link_targets(note.entry_id, 2) == {}
+    real.lock()

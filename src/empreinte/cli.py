@@ -144,12 +144,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 add_folder(vault, resolved, args.prefix, forbidden=forbidden)
             except ValueError as exc:
                 raise SystemExit(f"{folder} : {exc}") from None
-        watcher = Watcher(quiet=args.quiet, interval=args.interval)
+        # The vault and its exports are never scanned, even under a watched folder.
+        watcher = Watcher(quiet=args.quiet, interval=args.interval, forbidden=forbidden)
         watcher.load(vault)
         if not watcher.folders:
             raise SystemExit("Aucun dossier suivi : donnez au moins un dossier.")
         for folder in watcher.folders:
-            print(f"Suivi : {folder.path}" + (f"  (rangé sous {folder.prefix}/)" if folder.prefix else ""))
+            print(f"Suivi : {folder.path}" + (f"  (rangé sous {folder.prefix}/)" if folder.prefix else "")
+                  + (f"  [{folder.disabled_reason}]" if folder.disabled_reason else ""))
         print(f"Capture d'un fichier après {args.quiet:g} s sans modification. Ctrl+C pour arrêter.", flush=True)
         try:
             while True:
@@ -224,6 +226,9 @@ def session_for(path: Path, *, model: str | None = None, model_url: str = "http:
             raise VaultError(BUSY)
         return vault, Workspace(vault)
 
+    def check_passphrase(passphrase: str) -> None:
+        Vault.check_passphrase(path, passphrase)  # header only: no writer lock taken
+
     def create_vault(passphrase: str):
         vault = Vault.create(path, passphrase, kdf_params=kdf_params) if kdf_params else Vault.create(path, passphrase)
         recovery_key = vault.take_recovery_key()
@@ -247,6 +252,7 @@ def session_for(path: Path, *, model: str | None = None, model_url: str = "http:
 
     return Session(
         open_vault=open_vault,
+        check_passphrase=check_passphrase,
         create_vault=create_vault,
         exists=exists,
         import_folder=import_folder,

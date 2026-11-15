@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import stat
 import time
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -77,6 +78,48 @@ def read_bytes(path: Path) -> bytes:
     return _retry(lambda: Path(path).read_bytes())
 
 
+def read_bounded(path: Path, limit: int) -> bytes:
+    """Read a whole file through one handle, never more than `limit` bytes: a file that
+    is larger when it is read (even if it was small when stat() looked) raises TooLarge."""
+    def action() -> bytes:
+        with open(path, "rb") as handle:
+            data = handle.read(limit + 1)
+        return data
+    data = _retry(action)
+    if len(data) > limit:
+        raise TooLarge(f"{Path(path).name} is larger than {limit} bytes")
+    return data
+
+
+class TooLarge(ValueError):
+    """A file or a record exceeds its bound; nothing beyond the bound was read."""
+
+
+def iter_bounded_lines(path: Path, limit: int):
+    """Yield (line_number, line) for each line of a file, read as a stream from one handle.
+
+    A line longer than `limit` bytes yields (line_number, None) and is skipped without
+    being held in memory, so a long file costs one record at a time and one oversized
+    record cannot make the reader allocate without bound. The newline is stripped.
+    """
+    handle = _retry(lambda: open(path, "rb"))
+    with handle:
+        number = 0
+        while True:
+            line = handle.readline(limit + 1)
+            if not line:
+                return
+            number += 1
+            if len(line) > limit and not line.endswith(b"\n"):
+                while True:  # skip the rest of the oversized line in bounded chunks
+                    rest = handle.readline(1 << 16)
+                    if not rest or rest.endswith(b"\n"):
+                        break
+                yield number, None
+                continue
+            yield number, line.rstrip(b"\r\n")
+
+
 def append_bytes(path: Path, data: bytes) -> None:
     """Append and fsync. The ledger is the only file that grows in place.
 
@@ -119,22 +162,51 @@ class WriterLock:
         self._handle = None
         self._identity: tuple[int, int] | None = None
 
+    NOT_PLAIN = ("writer.lock is a link or not a plain file; opened read-only "
+                 "(replace it by an ordinary file, or delete it, to write again)")
+
     def acquire(self) -> str | None:
-        """Take the lock without waiting. Returns None on success, else why it is held."""
+        """Take the lock without waiting. Returns None on success, else why it is held.
+
+        writer.lock must be a plain file with a single name: a symbolic link, a hard link
+        to another file, a junction or a directory is refused before anything is written,
+        so locking never truncates a file outside the vault. The opened handle is checked
+        against the path, and it is closed on every failure until this object owns it.
+        """
         if self._handle is not None:
             return None
-        handle = _retry(lambda: open(self.path, "a+b"))  # never truncates, never deletes
+        if _is_link(self.path) or self.path.is_dir():
+            return self.NOT_PLAIN
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            _lock_byte(handle, self.LOCK_OFFSET)
+            fd = _retry(lambda: os.open(self.path, flags, 0o600))  # never truncates, never deletes
         except OSError:
-            handle.close()
-            return "another writer (a process, or another open Vault object) holds this vault; opened read-only"
-        info = json.dumps({"pid": os.getpid(), "host": socket.gethostname()}).encode("ascii")
-        handle.seek(0)
-        handle.truncate()
-        handle.write(info + b"\n")  # informational only: the OS lock is the truth
-        handle.flush()
-        status = os.fstat(handle.fileno())
+            if self.path.is_dir() or _is_link(self.path):
+                return self.NOT_PLAIN
+            raise
+        handle = None
+        try:
+            handle = os.fdopen(fd, "r+b")
+            if not _same_plain_file(handle.fileno(), self.path):
+                handle.close()
+                return self.NOT_PLAIN
+            try:
+                _lock_byte(handle, self.LOCK_OFFSET)
+            except OSError:
+                handle.close()
+                return "another writer (a process, or another open Vault object) holds this vault; opened read-only"
+            info = json.dumps({"pid": os.getpid(), "host": socket.gethostname()}).encode("ascii")
+            handle.seek(0)
+            handle.truncate()
+            handle.write(info + b"\n")  # informational only: the OS lock is the truth
+            handle.flush()
+            status = os.fstat(handle.fileno())
+        except BaseException:
+            if handle is not None:
+                handle.close()  # closing releases the OS lock
+            else:
+                os.close(fd)
+            raise
         self._handle, self._identity = handle, (status.st_dev, status.st_ino)
         return None
 
@@ -160,6 +232,32 @@ class WriterLock:
             pass
         finally:
             handle.close()  # closing releases the lock in any case
+
+
+_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: symbolic links and junctions on Windows
+
+
+def _is_link(path: Path) -> bool:
+    """True when path exists and is a symbolic link, a junction or another reparse point."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def _same_plain_file(fd: int, path: Path) -> bool:
+    """The open handle is a regular file with one name, and that name is `path` itself."""
+    opened = os.fstat(fd)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+        return False
+    try:
+        here = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(here.st_mode) or getattr(here, "st_file_attributes", 0) & _REPARSE_POINT:
+        return False
+    return (here.st_dev, here.st_ino) == (opened.st_dev, opened.st_ino)
 
 
 def _lock_byte(handle, offset: int) -> None:

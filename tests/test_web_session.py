@@ -14,3 +14,13 @@ def test_web_session_regressions():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "all checks passed" in result.stdout
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_lock_during_initialisation_stops_it():  # closing audit A3, defect 6
+    result = subprocess.run(
+        ["node", str(Path(__file__).with_name("web_init.test.mjs"))],
+        capture_output=True, text=True, encoding="utf-8", timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "all checks passed" in result.stdout

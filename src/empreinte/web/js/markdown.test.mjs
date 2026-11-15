@@ -133,5 +133,15 @@ for (const [name, md] of slow) {
   check(`${name}: text kept`, toHTMLString(tree).length > 0);
 }
 
+// Closing audit A8: a wide header with many short rows cannot multiply into millions of
+// cells (5,599 characters used to give 640,000 cells): columns are capped.
+const wide = "|a".repeat(800) + "|\n" + "|-".repeat(800) + "|\n" + "|\n".repeat(4000);
+const t1 = Date.now();
+const wideHtml = toHTMLString(parse(wide));
+const cells = (wideHtml.match(/<td/g) || []).length;
+check(`wide table: ${cells} cells`, cells <= 64 * 4000);
+check(`wide table: ${Date.now() - t1} ms`, Date.now() - t1 < 1500);
+check("wide table: columns beyond the cap are said to be omitted", wideHtml.includes("colonnes omises"));
+
 if (failures) { console.log(`${failures} failure(s)`); process.exit(1); }
 console.log("markdown: all checks passed");

@@ -784,7 +784,7 @@ def test_oversized_header_and_anchors_are_not_parsed(filled, monkeypatch):
     with open(path / "anchors.jsonl", "wb") as handle:
         handle.truncate(vault_module.MAX_ANCHORS_BYTES + 1)
     v = reopen(path)
-    with pytest.raises(Corrupted, match="anchors.jsonl is larger"):
+    with pytest.raises(Corrupted, match="anchors line 1: larger than"):
         v.put("x.md", b"x")
 
 
@@ -824,4 +824,24 @@ def test_unknown_catalog_version_is_refused(filled):
     filled.lock()
     (path / "catalog.bin").write_bytes(blob)
     with pytest.raises(VaultError, match="catalog format version 2"):
+        reopen(path)
+
+
+def test_header_bound_holds_on_the_read_itself(filled, monkeypatch):  # N12
+    """A header swapped for a huge file after stat() looked is still refused: the bound is
+    applied to the bytes read through the open handle, not to a stat beforehand."""
+    path = filled.path
+    filled.lock()
+    import empreinte.vault as vault_module
+    header = (path / "header.json").read_bytes()
+    small = path / "small.tmp"
+    small.write_bytes(header)
+    (path / "header.json").write_bytes(header.rstrip() + b" " * (vault_module.MAX_HEADER_BYTES + 1) + b"\n")
+    real_stat = Path.stat
+
+    def lying_stat(self, *args, **kwargs):  # what stat() saw just before the swap
+        return real_stat(small if self.name == "header.json" else self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", lying_stat)
+    with pytest.raises(Corrupted, match="larger than"):
         reopen(path)

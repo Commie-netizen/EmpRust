@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import cryptography
 from cryptography.hazmat.primitives.serialization import Encoding
 
 from empreinte import crypto
@@ -26,6 +27,58 @@ SECRET_TITLE = "Titre très secret"
 SECRET_PATH = "secret/caché.md"
 SECRET_TAG = "confidentiel"
 SECRET_TEXT = "texte jamais publié nulle part"
+
+
+@pytest.mark.parametrize("step", ["catalogue.json", "anchor", "README.txt", "copy", "ids", "history", "rename", "rollback"])
+def test_review_9_failed_export_leaves_no_publication(tmp_path, monkeypatch, step):
+    from empreinte import catalogue
+    tsa = FakeTSA()
+    v = Vault.create(tmp_path / "v", "pw", kdf_params=crypto.TEST_KDF, transport=tsa)
+    v.trust_roots = [tsa.root]
+    try:
+        item = v.put("a.md", b"a")
+        approve(v, item.entry_id, "summary")
+        v.anchor()
+        out = tmp_path / "out"
+        real_write, real_aux = catalogue.atomic_write, v.aux_put
+        history_writes = []
+        def write(path, data):
+            if path.name == step or (step == "anchor" and path.suffix == ".tst"):
+                raise OSError("injected write failure")
+            return real_write(path, data)
+        def aux(key, data):
+            if key == catalogue.PUBLISHED_KEY:
+                history_writes.append(data)
+                if step == "rollback" and len(history_writes) > 1:
+                    raise OSError("injected rollback failure")
+            if (step == "ids" and key == catalogue.IDS_KEY) or (step == "history" and key == catalogue.PUBLISHED_KEY):
+                raise OSError("injected aux failure")
+            return real_aux(key, data)
+        monkeypatch.setattr(catalogue, "atomic_write", write)
+        monkeypatch.setattr(v, "aux_put", aux)
+        def fail(*args, **kwargs):
+            raise OSError("injected failure")
+        if step == "copy":
+            monkeypatch.setattr(catalogue.shutil, "copyfile", fail)
+        if step in {"rename", "rollback"}:
+            monkeypatch.setattr(Path, "rename", fail)
+        with pytest.raises(OSError, match="injected"):
+            v.export_catalogue([CatalogueChoice(entry_id=item.entry_id)], out)
+        assert v.catalogues() == []
+        assert not out.exists() or list(out.iterdir()) == []
+    finally:
+        v.lock()
+
+
+def test_review_11_wording(world):
+    readme = (world["dir"] / "README.txt").read_text(encoding="utf-8")
+    ui = (VERIFIER.parents[1] / "src/empreinte/web/js/views/licenses.js").read_text(encoding="utf-8")
+    for text in (readme, ui):
+        assert "ancre prouvée" in text
+        assert "autorité non authentifiée" in text
+        assert "Sans ancre" in text
+        assert "déclarations du propriétaire" in text
+    assert "owner assertions, not verified facts" in readme
 
 
 def approve(vault, entry_id: str, summary: str, *, approved: bool = True) -> Preview:
@@ -65,7 +118,13 @@ def world(tmp_path_factory):
 
 
 def run(*args: str, cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, "-I", str(VERIFIER), *args], capture_output=True, text=True,
+    # The managed interpreter supplies dependencies through PYTHONPATH, which -I
+    # deliberately ignores. Keep isolation from the repo and explicitly supply only
+    # the dependency directory already used by this test process.
+    dependencies = str(Path(cryptography.__file__).resolve().parent.parent)
+    bootstrap = ("import sys, runpy; sys.path.insert(0, sys.argv.pop(1)); "
+                 "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')")
+    return subprocess.run([sys.executable, "-I", "-c", bootstrap, dependencies, str(VERIFIER), *args], capture_output=True, text=True,
                           encoding="utf-8", errors="replace", cwd=cwd, timeout=60)
 
 
@@ -269,7 +328,9 @@ def test_a_bundle_item_is_matched_to_its_catalogue_entry(world):
     root = world["root"]
     result = run(str(world["bundle"]), "--catalogue", str(world["dir"]), "--tsa-ca", str(root / "root.pem"),
                  cwd=root)
-    assert result.returncode == 0, result.stdout + result.stderr
+    # One licensed item is not listed: the bundle's items are not all catalogue entries.
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "BUNDLE: ALL CHECKS PASSED" in result.stdout and "MATCH: FAILED (2 of 3" in result.stdout
     pub = {p.entry_id: p.public_id for p in world["pub"].entries}
     out = result.stdout
     assert f"same document as catalogue entry {pub[world['a'].entry_id]}" in out
@@ -333,3 +394,75 @@ def test_server_catalogue_routes(tmp_path):
         assert len(h.call("GET", "/api/catalogue")[1]["publications"]) == 1
     finally:
         h.close()
+
+
+# --------------------------------------------------- fix round after the closing audit
+
+
+def test_every_tampered_catalogue_exits_1_with_a_reason(world, tmp_path):  # closing audit
+    document = json.loads((world["dir"] / "catalogue.json").read_text(encoding="utf-8"))
+    changes = _every_field_change(document)
+    changes += [("entries.0.record.-seq", lambda d: d["entries"][0]["record"].pop("seq")),
+                ("entries.0.-record", lambda d: d["entries"][0].update(record="x")),
+                ("-entries", lambda d: d.pop("entries")),
+                ("anchors.0.-proof", lambda d: d["anchors"][0].pop("proof")),
+                ("public_key", lambda d: d.update(public_key="zz")),
+                ("format", lambda d: d.update(format="autre-chose"))]
+    for name, change in changes:
+        result = tampered(world, tmp_path, change)
+        assert result.returncode == 1, (name, result.returncode, result.stdout, result.stderr)
+        assert "VERDICT: FAILED" in result.stdout and "problem:" in result.stdout, (name, result.stdout)
+
+
+def _raw_catalogue(world, tmp_path, text: str) -> subprocess.CompletedProcess:
+    target = tmp_path / "raw"
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(world["dir"], target)
+    (target / "catalogue.json").write_text(text, encoding="utf-8")
+    return run("--catalogue", str(target), "--tsa-ca", str(world["root"] / "root.pem"), cwd=tmp_path)
+
+
+def test_a_duplicate_key_is_refused_even_when_the_signature_holds(world, tmp_path):  # review finding 7
+    text = (world["dir"] / "catalogue.json").read_text(encoding="utf-8")
+    document = json.loads(text)
+    entry = document["entries"][0]
+    # A first "summary" key that a first-value reader would show; Python keeps the last.
+    forged = text.replace(json.dumps(entry["summary"], ensure_ascii=False),
+                          json.dumps("Résumé inventé par un tiers.", ensure_ascii=False) + ', "summary": '
+                          + json.dumps(entry["summary"], ensure_ascii=False), 1)
+    assert forged != text
+    result = _raw_catalogue(world, tmp_path, forged.replace('"summary": "Résumé inventé', '"summary":"Résumé inventé'))
+    assert result.returncode == 1 and "duplicate key" in result.stdout, result.stdout + result.stderr
+
+
+def test_deep_nesting_is_refused_cleanly(world, tmp_path):  # review finding 7
+    result = _raw_catalogue(world, tmp_path, '{"format": "empreinte-catalogue", "x": ' + "[" * 100000 + "]" * 100000 + "}")
+    assert result.returncode in (1, 2) and "Traceback" not in result.stderr
+    assert "nested" in result.stdout + result.stderr
+
+
+def test_a_bundle_of_other_documents_does_not_pass_the_catalogue_question(world, tmp_path):  # review finding 8
+    v = world["vault"]
+    root = world["root"]
+    other = v.put("autre/hors-catalogue.md", b"# Hors catalogue\n\nrien a voir")
+    grant = v.grant("Editions Y", [(other.entry_id, None)], usage="autre")
+    bundle = v.export_bundle(grant.license_id, tmp_path / "bundles")
+    alone = run(str(bundle), "--tsa-ca", str(root / "root.pem"), cwd=root)
+    assert alone.returncode == 0, alone.stdout  # a valid bundle on its own
+    both = run(str(bundle), "--catalogue", str(world["dir"]), "--tsa-ca", str(root / "root.pem"), cwd=root)
+    assert both.returncode == 1, both.stdout
+    assert "BUNDLE: ALL CHECKS PASSED" in both.stdout and "CATALOGUE: ALL CHECKS PASSED" in both.stdout
+    assert "MATCH: FAILED" in both.stdout
+    summary = json.loads(run(str(bundle), "--catalogue", str(world["dir"]), "--json", cwd=root).stdout)
+    assert summary["ok"] is False and summary["bundle"]["ok"] is True and summary["catalogue"]["ok"] is True
+    assert summary["match"]["ok"] is False and summary["match"]["matched"] == 0 and summary["match"]["items"] == 1
+
+
+def test_a_bundle_of_listed_entries_passes_the_catalogue_question(world, tmp_path):  # review finding 8
+    v, a, b, root = world["vault"], world["a"], world["b"], world["root"]
+    grant = v.grant("Editions Z", [(a.entry_id, None), (b.entry_id, None)], usage="anthologie")
+    bundle = v.export_bundle(grant.license_id, tmp_path / "bundles")
+    result = run(str(bundle), "--catalogue", str(world["dir"]), "--tsa-ca", str(root / "root.pem"), cwd=root)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "MATCH: ALL 2 BUNDLE ITEMS ARE ENTRIES OF THIS CATALOGUE" in result.stdout

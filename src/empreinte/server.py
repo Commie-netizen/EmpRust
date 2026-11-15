@@ -31,8 +31,8 @@ is treated as hostile territory:
 * denial of service: the request line plus headers and the body each have a total
   deadline enforced on every recv (a trickling client cannot extend it), concurrent
   connections are capped (503 beyond), a rejected request is answered and closed without
-  reading its body, "Expect: 100-continue" is refused (417), and preview generation runs
-  outside the operation lock;
+  reading its body, "Expect: 100-continue" is refused (417), and preview generation and
+  the request to the timestamp authority run outside the operation lock;
 * every response the process emits, including http.server's own error pages, carries a
   strict Content-Security-Policy (no inline script, no remote origin), `Cache-Control:
   no-store`, nosniff, frame denial and no referrer. The server writes nothing to disk
@@ -56,7 +56,7 @@ changing, needs a same-origin Origin). Errors are `{"error": code, "message": te
     POST   /api/lock                      XS  {} -> {locked: true}; needs U when a session is open
     GET    /api/entries                   XU  [EntryMeta]
     GET    /api/entries/<id>              XU  {meta, parsed, outlinks, backlinks, link_targets}
-    GET    /api/entries/<id>/text         XU  ?version=n -> {entry_id, version, media_type, text}
+    GET    /api/entries/<id>/text         XU  ?version=n -> {entry_id, version, media_type, text, link_targets}
     GET    /api/entries/<id>/versions     XU  [Version]
     GET    /api/entries/<id>/proof        XU  ?version=n -> ProvenanceProof
     POST   /api/entries/<id>/remove       XUS {confirm: true} -> {removed: id}
@@ -185,6 +185,11 @@ class Session:
     make_watcher: Callable[[], Any] | None = None
     # Folders a watched folder may neither contain nor be inside (the vault, its exports).
     watch_forbidden: tuple[Path, ...] = ()
+    # Raises WrongPassphrase unless the passphrase opens the vault, without opening it for
+    # writing or disturbing an open session. Used to authenticate an unlock that would
+    # replace the open session before that session is closed. Without it, the server
+    # closes the open session first (an integrator that cannot check separately).
+    check_passphrase: Callable[[str], None] | None = None
 
 
 @dataclass
@@ -271,6 +276,18 @@ def to_json(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+_CONTENT_LENGTH = re.compile(r"[0-9]{1,15}")  # ASCII digits only; 15 digits is far above any limit
+
+
+def content_length(raw: str | None) -> int | None:
+    """The declared body length, or None when the header is absent or not a plain
+    decimal number of reasonable size (never an exception, so the answer is a 400)."""
+    if raw is None:
+        return None
+    value = raw.strip()
+    return int(value) if _CONTENT_LENGTH.fullmatch(value) else None
 
 
 def bad(message: str) -> ApiError:
@@ -482,7 +499,13 @@ class App:
         def on_capture(vault: VaultAPI, captures: list) -> None:
             active.workspace.refresh()
 
-        thread = WatchThread(factory(), run_locked, on_capture)
+        watcher = factory()
+        # The vault and export locations are excluded from every scan, and a remembered
+        # folder that overlaps them is shown disabled (Watcher.load revalidates).
+        exclude = getattr(watcher, "exclude", None)
+        if callable(exclude):
+            exclude(self.session.watch_forbidden)
+        thread = WatchThread(watcher, run_locked, on_capture)
         active.watcher = thread
         thread.start()
 
@@ -584,7 +607,9 @@ ROUTES: list[Route] = [
     _r("PUT", r"/api/prefs", "prefs_put"),
 ]
 STATE_CHANGING = {"POST", "PUT", "DELETE"}
-OUTSIDE_LOCK = {"previews"}  # long work: runs without the operation lock, see _Guarded
+# Long work that runs without the operation lock: previews (see _Guarded) and the HTTP
+# request to the timestamp authority (Vault.anchor re-checks its own state afterwards).
+OUTSIDE_LOCK = {"previews", "anchor"}
 
 
 class _Guarded:
@@ -760,14 +785,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(err.status, body, extra)
 
     def _drain_small_body(self) -> bool:
-        length = self.headers.get("Content-Length")
-        if self.headers.get("Transfer-Encoding") or length is None or not length.strip().isdigit():
-            return False
-        if int(length) > self.app.options.max_body:
+        length = content_length(self.headers.get("Content-Length"))
+        if self.headers.get("Transfer-Encoding") or length is None or length > self.app.options.max_body:
             return False
         self.rfile.deadline = time.monotonic() + self.app.options.body_deadline  # type: ignore[attr-defined]
         try:
-            return len(self.rfile.read(int(length))) == int(length)
+            return len(self.rfile.read(length)) == length
         except (TimeoutError, OSError):
             return False
 
@@ -935,9 +958,9 @@ class Handler(BaseHTTPRequestHandler):
         raw_length = self.headers.get("Content-Length")
         if raw_length is None:
             raise ApiError(411, "length_required", "Content-Length requis")
-        if not raw_length.isdigit():
+        length = content_length(raw_length)
+        if length is None:
             raise bad("Content-Length invalide")
-        length = int(raw_length)
         if length > self.app.options.max_body:
             raise ApiError(413, "too_large", "corps de requête trop grand")
         self.rfile.deadline = time.monotonic() + self.app.options.body_deadline  # type: ignore[attr-defined]
@@ -1012,14 +1035,30 @@ class Handler(BaseHTTPRequestHandler):
     def api_unlock(self, *, params: dict, body: dict) -> dict:
         passphrase = req_str(body, "passphrase", min_len=1, max_len=1024)
         app = self.app
+        # Registered before waiting for its turn: a lock, an idle lock or another unlock
+        # that happens while this attempt waits or runs makes it install nothing.
+        with app.lock:
+            seen = app.generation
         with app.auth_lock:
             wait = app.limiter.wait()
             if wait > 0:
                 raise ApiError(429, "rate_limited", "trop d'essais, patientez", retry_after=wait)
-            # Close the current session before opening the vault again: a second
-            # instance would find the first one's writer lock and stay read-only.
-            app.do_lock()
-            seen = app.generation
+            check = app.session.check_passphrase
+            with app.lock:
+                replacing = app.active is not None
+            if replacing and check is not None:
+                # A session is open: authenticate first, without touching it, so a wrong
+                # passphrase never closes another page's session.
+                self._authenticate(check, passphrase)
+            if replacing:
+                # Then hand the writer lock over: close the current session (a second
+                # instance would find its writer lock and stay read-only), unless the
+                # session changed meanwhile.
+                with app.lock:
+                    if app.stopped or app.generation != seen:
+                        raise ApiError(409, "locked_meanwhile", "l'archive a été verrouillée pendant l'ouverture")
+                    app.do_lock()
+                    seen = app.generation
             try:
                 vault, workspace = app.session.open_vault(passphrase)
             except WrongPassphrase:
@@ -1030,13 +1069,22 @@ class Handler(BaseHTTPRequestHandler):
             token = self._installed(vault, workspace, seen)
         return {"unlock_token": token, "idle_timeout": app.options.idle_timeout}
 
+    def _authenticate(self, check: Callable[[str], None], passphrase: str) -> None:
+        try:
+            check(passphrase)
+        except WrongPassphrase:
+            self.app.limiter.failure()
+            raise ApiError(401, "wrong_passphrase", "phrase de passe incorrecte",
+                           retry_after=self.app.limiter.wait() or None) from None
+
     def api_create(self, *, params: dict, body: dict) -> dict:
         passphrase = req_str(body, "passphrase", min_len=10, max_len=1024)
         app = self.app
+        with app.lock:
+            seen = app.generation  # registered before waiting, as for an unlock
         with app.auth_lock:
             if app.session.exists():
                 raise ApiError(409, "exists", "une archive existe déjà")
-            seen = app.generation
             vault, workspace, recovery = app.session.create_vault(passphrase)
             token = self._installed(vault, workspace, seen)
         return {"unlock_token": token, "idle_timeout": app.options.idle_timeout, "recovery_key": recovery}
@@ -1070,9 +1118,11 @@ class Handler(BaseHTTPRequestHandler):
         meta = self._vault().entry(entry_id)
         if version is not None and version > meta.n_versions:
             raise ApiError(404, "not_found", "version inconnue")
-        text = self._ws().text(entry_id, version)
+        ws = self._ws()
+        text = ws.text(entry_id, version)
+        # The links of the version shown, not of the latest (a link removed later stays live).
         return {"entry_id": entry_id, "version": version or meta.n_versions, "media_type": meta.media_type,
-                "text": text}
+                "text": text, "link_targets": ws.link_targets(entry_id, version)}
 
     def api_entry_versions(self, raw_id: str, *, params: dict, body: dict) -> list:
         return self._vault().versions(entry_id_of(raw_id))
@@ -1145,6 +1195,9 @@ class Handler(BaseHTTPRequestHandler):
             raise bad("méthode d'ancrage non disponible pour cette archive")
         if not req_bool(body, "confirm"):
             raise bad("confirmation requise : seule l'empreinte de 32 octets de la tête de chaîne est envoyée")
+        # Runs without the operation lock (see OUTSIDE_LOCK): the authority may take
+        # seconds. The vault serialises its own state and refuses to store the anchor if
+        # it was locked, or its ledger changed, during the request.
         return self._vault().anchor(method)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------- licensing
@@ -1266,6 +1319,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(401, "locked", "archive verrouillée")
             for value in ids:
                 active.vault.entry(value)  # NotFound before the model runs
+            before = {value: active.vault.aux_get(PREVIEW_KEY + value) for value in ids}
         # The model runs without the operation lock: locking, idle lock and other
         # requests are not held up. Vault and workspace calls are checked one by one,
         # and the stored results are committed only if the session did not change.
@@ -1274,14 +1328,36 @@ class Handler(BaseHTTPRequestHandler):
         with app.lock:
             if app.active is not active:
                 raise ApiError(409, "locked_meanwhile", "l'archive a été verrouillée pendant la génération")
+            # Refuse the whole result if a note changed during the generation, or if
+            # another preview was stored for it meanwhile: a late job never overwrites
+            # newer state.
+            for key, value in writes:
+                if key.startswith(PREVIEW_KEY) and self._stale_preview(active.vault, key[len(PREVIEW_KEY):], value,
+                                                                       before.get(key[len(PREVIEW_KEY):])):
+                    raise ApiError(409, "stale", "la note ou son aperçu a changé pendant la génération : relancez-la")
             for key, value in writes:
                 active.vault.aux_put(key, value)
-        stored = {key[len(PREVIEW_KEY):]: value for key, value in writes if key.startswith(PREVIEW_KEY)}
-        out = []
-        for preview in previews:
-            raw_bytes = stored.get(preview.entry_id, preview.model_dump_json().encode("utf-8"))
-            out.append({**preview.model_dump(mode="json"), "current": True, "digest": preview_digest(raw_bytes)})
+            out = []
+            for preview in previews:
+                # Digest and current state from what storage holds now.
+                raw_bytes = active.vault.aux_get(PREVIEW_KEY + preview.entry_id) or preview.model_dump_json().encode("utf-8")
+                current = not self._stale_preview(active.vault, preview.entry_id, raw_bytes, raw_bytes)
+                out.append({**preview.model_dump(mode="json"), "current": current, "digest": preview_digest(raw_bytes)})
         return out
+
+    @staticmethod
+    def _stale_preview(vault: VaultAPI, entry_id: str, raw: bytes, stored_before: bytes | None) -> bool:
+        """True when `raw` no longer describes the entry's latest version, or the stored
+        preview differs from the one there when generation started (caller holds App.lock)."""
+        if vault.aux_get(PREVIEW_KEY + entry_id) != stored_before:
+            return True
+        try:
+            preview = Preview.model_validate_json(raw)
+        except ValidationError:
+            return True
+        latest = vault.versions(entry_id)[-1]
+        return not (preview.entry_id == entry_id and preview.version == latest.version
+                    and preview.commitment == latest.commitment)
 
     def _stored_preview(self, entry_id: str) -> tuple[Preview, bool, str]:
         vault = self._vault()

@@ -292,7 +292,14 @@ fsynced; NTFS journals the rename.
 handle on `writer.lock` with an exclusive operating-system lock on one byte at offset
 2^20 (`msvcrt.locking` on Windows, `fcntl.flock` elsewhere). The system releases it when
 the handle closes or the process dies, so a crash leaves nothing to reclaim, and the
-file is never deleted. A vault opened while another process, or another open Vault
+file is never deleted. `writer.lock` must be a plain file with a single name: a symbolic
+link, a junction, a hard link to another file or a directory is refused before anything
+is written (the vault opens read-only and `notices` says why), and the opened handle is
+checked against the path, so taking the lock can never truncate a file elsewhere. A
+handle is closed on every failure until the lock is owned. A server that already holds
+an open session authenticates a new unlock from the header alone
+(`Vault.check_passphrase`, no lock taken) before it closes that session and hands the
+writer lock over; a wrong passphrase leaves the open session untouched. A vault opened while another process, or another open Vault
 object of the same process, holds the lock is read-only: `notices` says so, and every
 write (ledger, catalog, blobs, aux values, anchors, passphrase and recovery wraps, and
 the flush at the end of a batch, even an empty one) is refused. To replace a session in
@@ -328,8 +335,12 @@ vault read-only (`Corrupted`) for the life of the object.
 One JSON object per line (the `Anchor` model): `seq_upto`, `head_hash` (record_hash of
 `seq_upto`), `method` (`rfc3161`), `authority` (URL), `anchored_at` (time asserted by
 the authority, ISO 8601 UTC), `proof` (base64 of the DER TimeStampToken, a CMS
-ContentInfo). A reader bounds the file (16 MiB) and each proof (the base64 of a token of
-at most 256 KiB) before decoding.
+ContentInfo). A reader reads the file as a stream of records, each bounded (the base64
+of a token of at most 256 KiB, plus 4 KiB of fields): a long history stays readable, and
+an oversized line is refused without being read whole. The catalog's `n_anchors` is the
+recorded count: it grows when an anchor is appended, or at open once the anchors found
+beyond it were checked, never during the replay of a lagging catalog, so a deletion of
+anchors is reported at every opening.
 
 Request (RFC 3161 section 2.4.1), DER, POSTed with `Content-Type:
 application/timestamp-query`:
@@ -452,8 +463,18 @@ Verification algorithm (what `tools/verify_bundle.py` does):
    each proof 256 KiB once decoded. The bundle must hold exactly the granted items, each
    once.
 
-`verify_bundle.py` needs Python 3.11+ and cryptography 49.0 or later; an older version is
-refused with a message and exit status 2.
+7. JSON (manifest, grant, catalogue) must mean one thing to every reader: a duplicate
+   key at any depth, or nesting deeper than 64 levels, is refused. The bundle directory
+   is resolved once at the start; each file must then lie inside that directory, and the
+   directory must still be the same one (device and file id), so replacing it or a parent
+   by a link during the verification cannot redirect a read.
+
+Exit status: 0 when every check passed, 1 when something was verified and failed (a
+tampered bundle or catalogue, whatever was changed, including a catalogue whose structure
+no longer parses), 2 when there was nothing to verify (missing or unreadable file, text
+that is not JSON, an object without a `format` field, or an ambiguous or too deeply
+nested bundle manifest). `verify_bundle.py` needs Python 3.11+ and cryptography 49.0 or
+later; an older version is refused with a message and exit status 2.
 
 The licensee must obtain the vault public key from the author by another channel (a
 published fingerprint) to know whose key it is; the bundle proves consistency with that
@@ -605,7 +626,11 @@ or its `catalogue.json`):
    both must carry the same public key, and each verified bundle item is matched to the
    verified catalogue entry with the same commitment and the same record (seq and
    record hash). That is what makes the catalogue a promise that can be checked: the
-   licensed document is the one the catalogue dated.
+   licensed document is the one the catalogue dated. Three verdicts are printed (BUNDLE,
+   CATALOGUE, MATCH) and given apart in the JSON (`bundle.ok`, `catalogue.ok`,
+   `match.ok` with `matched` and `items`). MATCH passes only when the keys are the same
+   and every bundle item is an entry of the catalogue; the command succeeds only when
+   all three pass, so a valid bundle of other documents is not a success here.
 
 What a catalogue proves: that the vault key signed this list, and that each listed
 document, identified by its commitment, was recorded in that vault's ledger and, with a

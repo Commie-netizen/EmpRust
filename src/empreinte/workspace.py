@@ -42,11 +42,18 @@ class Workspace:
             container.clear()
         self._index.clear()
 
-    def link_targets(self, entry_id: str) -> dict[str, str]:
-        """Use the same source-aware resolution as the graph."""
+    def link_targets(self, entry_id: str, version: int | None = None) -> dict[str, str]:
+        """Use the same source-aware resolution as the graph, for the links of `version`
+        (None: the latest), resolved against the current entries."""
         self._ensure_open()
-        self.vault.entry(entry_id)
-        entry, doc = self._entries[entry_id], self._parsed[entry_id]
+        meta = self.vault.entry(entry_id)
+        entry = self._entries[entry_id]
+        if version is None or version == entry.n_versions:
+            doc = self._parsed[entry_id]
+        elif not is_text(meta.media_type):
+            return {}
+        else:
+            doc = parse_document(self.text(entry_id, version), path=entry.path, media_type=entry.media_type)
         by_path = {e.path: e.entry_id for e in self._entries.values()}
         resolver = _Resolver(by_path)
         return {target: by_path[path] for target in (*doc.links, *doc.embeds)

@@ -109,6 +109,65 @@ class BundleError(Exception):
     pass
 
 
+class Unreadable(BundleError):
+    """The file cannot be read as a JSON object at all (missing, too large, not JSON):
+    there is nothing to verify, so the command exits with status 2."""
+
+
+# ========================================================================= strict JSON
+
+MAX_JSON_DEPTH = 64  # bundles and catalogues nest about five levels
+
+
+def _json_depth_ok(text: str, limit: int) -> bool:
+    """True when arrays and objects nest at most `limit` deep (strings are skipped)."""
+    depth, in_string, escaped = 0, False, False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > limit:
+                return False
+        elif char in "]}":
+            depth -= 1
+    return True
+
+
+def strict_json(data: bytes, what: str) -> object:
+    """Parse JSON that must mean one thing to every reader: a duplicate key at any depth,
+    or nesting beyond MAX_JSON_DEPTH, is refused (BundleError) instead of being resolved
+    the way Python happens to resolve it. Not JSON at all raises Unreadable."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Unreadable(f"{what} is not UTF-8 text") from None
+    if not _json_depth_ok(text, MAX_JSON_DEPTH):
+        raise BundleError(f"{what} is nested more than {MAX_JSON_DEPTH} levels deep: refused")
+
+    def pairs(items: list) -> dict:
+        result: dict = {}
+        for key, value in items:
+            if key in result:
+                raise BundleError(f"{what} has a duplicate key {key[:80]!r}: ambiguous JSON refused")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(text, object_pairs_hook=pairs)
+    except RecursionError:
+        raise BundleError(f"{what} is nested too deeply to be read: refused") from None
+    except json.JSONDecodeError as exc:
+        raise Unreadable(f"{what} is not valid JSON ({exc.msg})") from None
+
+
 # =============================================================================== DER
 # Minimal DER (X.690) reader and writer: definite lengths, single-byte tags.
 
@@ -695,13 +754,42 @@ def _handle_path(fd: int) -> str | None:
     return None
 
 
-def open_bundle_file(bundle: Path, name: object, limit: int):
+@dataclass(frozen=True)
+class PinnedRoot:
+    """The bundle (or catalogue) directory, resolved once when verification starts.
+
+    Every file is then opened under `real`, and the directory found there must still be
+    the one first resolved (same device and file id): replacing the directory, or a parent
+    of it, by a link after the start cannot redirect later reads to files elsewhere.
+    """
+    real: str
+    identity: tuple[int, int]
+
+    def __truediv__(self, other: object) -> Path:
+        return Path(self.real) / str(other)
+
+
+def pin_root(bundle: "Path | PinnedRoot") -> PinnedRoot:
+    if isinstance(bundle, PinnedRoot):
+        return bundle
+    real = os.path.realpath(bundle)
+    try:
+        info = os.stat(real)
+    except OSError:
+        raise Unreadable(f"{str(bundle)[:200]} cannot be opened") from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise Unreadable(f"{str(bundle)[:200]} is not a directory")
+    return PinnedRoot(real, (info.st_dev, info.st_ino))
+
+
+def open_bundle_file(bundle: "Path | PinnedRoot", name: object, limit: int):
     """Open `name` inside the bundle and return the file object, checked after opening.
 
     The name must be plain and relative; the opened handle must be a regular file of at
-    most `limit` bytes whose real path is inside the bundle directory. Reading happens
-    through this handle only.
+    most `limit` bytes whose real path is inside the bundle directory as pinned when the
+    verification started (see PinnedRoot). Reading happens through this handle only.
     """
+    root = pin_root(bundle)
     if not isinstance(name, str) or not name or "\\" in name or "\x00" in name:
         raise BundleError(f"file name {str(name)[:80]!r} is not a plain relative path")
     posix, windows = PurePosixPath(name), PureWindowsPath(name)
@@ -709,7 +797,7 @@ def open_bundle_file(bundle: Path, name: object, limit: int):
         raise BundleError(f"file name {name[:80]!r} leaves the bundle")
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        fd = os.open(bundle / posix, flags)
+        fd = os.open(os.path.join(root.real, *posix.parts), flags)
     except OSError:
         raise BundleError(f"{name[:80]} is missing or cannot be opened (links are refused)") from None
     try:
@@ -721,9 +809,15 @@ def open_bundle_file(bundle: Path, name: object, limit: int):
         real = _handle_path(fd)
         if real is None:
             raise BundleError(f"{name[:80]}: cannot tell where the opened file is; refused")
-        root = os.path.normcase(os.path.realpath(bundle))
-        if not os.path.normcase(real).startswith(root.rstrip(os.sep) + os.sep):
+        inside = os.path.normcase(root.real).rstrip(os.sep) + os.sep
+        if not os.path.normcase(real).startswith(inside):
             raise BundleError(f"{name[:80]} resolves outside the bundle")
+        try:
+            now = os.stat(root.real)
+        except OSError:
+            now = None
+        if now is None or (now.st_dev, now.st_ino) != root.identity:
+            raise BundleError(f"{name[:80]}: the bundle directory was replaced during verification")
         if os.name != "nt" and hasattr(os, "O_NONBLOCK"):
             os.set_blocking(fd, True)
         return os.fdopen(fd, "rb")
@@ -801,7 +895,8 @@ class Verdict:
 
 def verify(bundle: Path, roots: list[x509.Certificate]) -> dict:
     """Check a bundle; return a report dict (see main() for how it is printed)."""
-    manifest = json.loads(read_bundle_file(bundle, "manifest.json", MAX_MANIFEST_BYTES))
+    bundle = pin_root(bundle)  # resolved once: later reads cannot be redirected elsewhere
+    manifest = strict_json(read_bundle_file(bundle, "manifest.json", MAX_MANIFEST_BYTES), "manifest.json")
     if not isinstance(manifest, dict) or manifest.get("format") != "empreinte-bundle" \
             or manifest.get("format_version") != 1:
         raise BundleError("not an Empreinte bundle of format version 1")
@@ -891,12 +986,12 @@ def verify(bundle: Path, roots: list[x509.Certificate]) -> dict:
     if not signed(key, grant_info["signature"], GRANT_PREFIX + grant_bytes):
         grant_verdict.problems.append("grant signature by the vault key is invalid")
     try:
-        grant = json.loads(grant_bytes)
+        grant = strict_json(grant_bytes, "grant.json")
         if not isinstance(grant, dict):
-            raise ValueError
-    except ValueError:
+            raise Unreadable("grant.json is not a JSON object")
+    except BundleError as exc:
         grant = {}
-        grant_verdict.problems.append("grant.json is not a JSON object")
+        grant_verdict.problems.append(str(exc))
     if grant.get("license_id") != manifest.get("license_id") or grant.get("seq") != grant_record.get("seq"):
         grant_verdict.problems.append("grant does not match the manifest (license id or record)")
     granted = [(i.get("entry_id"), i.get("version"), i.get("commitment")) for i in grant.get("items", [])
@@ -1014,14 +1109,32 @@ def catalogue_canonical(document: dict) -> bytes:
     return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def read_catalogue_document(path: Path) -> dict:
+    """The JSON object of a catalogue directory (its catalogue.json) or of the file itself.
+
+    Unreadable (exit status 2) only when there is no JSON object claiming to be a
+    catalogue: a missing or oversized file, text that is not JSON, or an object without a
+    "format" field. Anything else that is wrong, including ambiguous JSON, is a failed
+    verification of that catalogue (BundleError, exit status 1)."""
+    path = Path(path)
+    try:
+        data = read_bundle_file(path, "catalogue.json", MAX_CATALOGUE_BYTES) if path.is_dir() else \
+            read_bundle_file(path.parent, path.name, MAX_CATALOGUE_BYTES)
+    except BundleError as exc:
+        raise Unreadable(str(exc)) from None
+    document = strict_json(data, "catalogue.json")
+    if not isinstance(document, dict) or "format" not in document:
+        raise Unreadable("not an Empreinte catalogue (no format field)")
+    return document
+
+
 def load_catalogue(path: Path) -> dict:
     """A catalogue directory (its catalogue.json) or the JSON file itself, bounded and checked."""
-    path = Path(path)
-    data = read_bundle_file(path, "catalogue.json", MAX_CATALOGUE_BYTES) if path.is_dir() else \
-        read_bundle_file(path.parent, path.name, MAX_CATALOGUE_BYTES)
-    document = json.loads(data.decode("utf-8"))
-    if not isinstance(document, dict) or document.get("format") != "empreinte-catalogue" \
-            or document.get("format_version") != 1:
+    return check_catalogue_shape(read_catalogue_document(path))
+
+
+def check_catalogue_shape(document: dict) -> dict:
+    if document.get("format") != "empreinte-catalogue" or document.get("format_version") != 1:
         raise BundleError("not an Empreinte catalogue of format version 1")
     if set(document) != CATALOGUE_FIELDS:
         raise BundleError("catalogue has the wrong set of fields")
@@ -1062,8 +1175,30 @@ def _text(value: object, limit: int) -> bool:
 
 
 def verify_catalogue(path: Path, roots: list[x509.Certificate]) -> dict:
-    """Check a catalogue; return a report dict (see render_catalogue)."""
-    document = load_catalogue(path)
+    """Check a catalogue; return a report dict (see render_catalogue).
+
+    Raises Unreadable only when there is nothing to check. A catalogue that was altered
+    in any way, even one whose structure no longer parses as a catalogue, gives a report
+    with ok False and the reason, never an exception."""
+    try:
+        document = read_catalogue_document(path)
+    except Unreadable:
+        raise
+    except BundleError as exc:  # ambiguous JSON: refused, as a failed verification
+        return _failed_catalogue({}, roots, str(exc))
+    try:
+        return _verify_catalogue(check_catalogue_shape(document), roots)
+    except (BundleError, KeyError, TypeError, ValueError, AttributeError, IndexError, RecursionError) as exc:
+        reason = str(exc) if isinstance(exc, BundleError) else f"{type(exc).__name__} {str(exc)[:200]}"
+        return _failed_catalogue(document, roots, f"the catalogue is malformed: {reason}")
+
+
+def _failed_catalogue(document: dict, roots: list[x509.Certificate], reason: str) -> dict:
+    return {"ok": False, "document": document, "signature_ok": False, "entries": [], "anchors": [],
+            "general": [reason], "roots": len(roots)}
+
+
+def _verify_catalogue(document: dict, roots: list[x509.Certificate]) -> dict:
     general: list[str] = []
     key_hex = document["public_key"]
     try:
@@ -1196,7 +1331,7 @@ def render_catalogue(report: dict) -> str:
     lines = ["Empreinte catalogue verification", "",
              f"Catalogue {str(document.get('catalogue_id'))[:64]}, exported {str(document.get('exported_at'))[:40]} "
              "(author's clock)",
-             f"Vault key (Ed25519): {document['public_key']}",
+             f"Vault key (Ed25519): {str(document.get('public_key'))[:80]}",
              f"Catalogue signed by this key: {_yes(report['signature_ok'])}",
              f"Timestamp trust roots: {roots} certificate(s)" if roots else
              "Timestamp trust roots: none (give --tsa-ca or install certifi); timestamps can only be claims",
@@ -1245,7 +1380,11 @@ def match_bundle(bundle_report: dict, catalogue_report: dict) -> dict:
         if entry is not None and (entry.seq, entry.record_hash) != (record.get("seq"), record.get("record_hash")):
             entry = None
         matches.append({"item": verdict.name, "public_id": entry.public_id if entry else None})
-    return {"same_key": same_key, "matches": matches}
+    matched = sum(1 for m in matches if m["public_id"])
+    # The question asked when both are given: are the licensed documents the catalogue's
+    # entries? A valid bundle of other documents does not answer it with yes.
+    ok = same_key and bool(matches) and matched == len(matches)
+    return {"same_key": same_key, "matches": matches, "ok": ok, "matched": matched, "items": len(matches)}
 
 
 def _bundle_json(report: dict) -> dict:
@@ -1292,7 +1431,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.bundle is not None:
             report = verify(args.bundle, roots)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, BundleError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError, BundleError) as exc:
         print(f"cannot read the bundle: {exc}", file=sys.stderr)
         return 2
     try:
@@ -1303,7 +1442,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     matched = match_bundle(report, catalogue) if report is not None and catalogue is not None else None
     ok = (report is None or report["ok"]) and (catalogue is None or catalogue["ok"]) \
-        and (matched is None or matched["same_key"])
+        and (matched is None or matched["ok"])
     if args.json:
         if catalogue is None:
             summary = _bundle_json(report)
@@ -1311,6 +1450,8 @@ def main(argv: list[str] | None = None) -> int:
             summary = _catalogue_json(catalogue)
         else:
             summary = {"ok": ok, "bundle": _bundle_json(report), "catalogue": _catalogue_json(catalogue),
+                       "match": {"ok": matched["ok"], "same_key": matched["same_key"],
+                                 "matched": matched["matched"], "items": matched["items"]},
                        "same_key": matched["same_key"], "matches": matched["matches"]}
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0 if ok else 1
@@ -1327,7 +1468,15 @@ def main(argv: list[str] | None = None) -> int:
         for match in matched["matches"]:
             lines.append(f"{match['item']}: " + (f"same document as catalogue entry {match['public_id']}"
                                                  if match["public_id"] else "NOT an entry of this catalogue"))
-        lines += ["", "VERDICT: " + ("ALL CHECKS PASSED" if ok else "FAILED")]
+        if matched["ok"]:
+            match_line = f"MATCH: ALL {matched['items']} BUNDLE ITEMS ARE ENTRIES OF THIS CATALOGUE"
+        else:
+            match_line = (f"MATCH: FAILED ({matched['matched']} of {matched['items']} bundle items are entries "
+                          "of this catalogue)")
+        lines += ["", "BUNDLE: " + ("ALL CHECKS PASSED" if report["ok"] else "FAILED"),
+                  "CATALOGUE: " + ("ALL CHECKS PASSED" if catalogue["ok"] else "FAILED"),
+                  match_line,
+                  "VERDICT: " + ("ALL CHECKS PASSED" if ok else "FAILED")]
         sys.stdout.write("\n".join(lines) + "\n")
     return 0 if ok else 1
 

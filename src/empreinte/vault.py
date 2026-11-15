@@ -27,6 +27,7 @@ from typing import Callable, Iterator, Literal, Sequence
 
 from cryptography import x509
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
 
 from . import crypto
 from .anchor import DEFAULT_TSA_URL, MAX_PROOF_CHARS, TokenAssessment, Transport, assess_anchor, request_anchor
@@ -59,7 +60,8 @@ from .model import (
     VerifyReport,
     Version,
 )
-from .store import BlobStore, WriterLock, append_bytes, atomic_write, atomic_write_text, read_bytes
+from .store import (BlobStore, TooLarge, WriterLock, append_bytes, atomic_write, atomic_write_text,
+                    iter_bounded_lines, read_bounded, read_bytes)
 
 HEADER = "header.json"
 LEDGER = "ledger.jsonl"
@@ -67,7 +69,8 @@ CATALOG = "catalog.bin"
 ANCHORS = "anchors.jsonl"
 WRITER_LOCK = "writer.lock"
 MAX_HEADER_BYTES = 64 << 10
-MAX_ANCHORS_BYTES = 16 << 20
+MAX_ANCHORS_BYTES = 16 << 20  # former whole-file limit; anchors.jsonl is now read record by record
+MAX_ANCHOR_RECORD_BYTES = MAX_PROOF_CHARS + 4096  # one anchor line: its token in base64, plus its fields
 BLOBS = "blobs"
 AUX = "aux"
 VAULT_FORMAT = "empreinte-vault"
@@ -263,18 +266,16 @@ class Vault:
         write. To replace a session in the same process, close() the old one first.
         """
         header = _read_header(Path(path))
-        vault_id = bytes.fromhex(header["vault_id"])
-        params = KdfParams.from_dict(header["kdf"])  # range-checked before any derivation
-        try:
-            salt = bytes.fromhex(header["kdf"]["salt"])
-            kek = crypto.derive_passphrase_key(passphrase, salt, params)
-            master = crypto.unwrap(kek, header["master_key_wraps"]["passphrase"],
-                                   crypto.wrap_aad("passphrase", vault_id, _kdf_aad(header["kdf"])))
-        except InvalidTag:
-            raise WrongPassphrase("wrong passphrase") from None
-        except (KeyError, ValueError, TypeError):
-            raise Corrupted("header: malformed passphrase wrap") from None
+        master = _passphrase_master(header, passphrase)
         return cls(path, header, master, clock=clock, via_recovery=False, tsa_url=tsa_url, transport=transport)
+
+    @classmethod
+    def check_passphrase(cls, path: Path, passphrase: str) -> None:
+        """Raise WrongPassphrase unless `passphrase` opens this vault. Reads the header
+        only: no writer lock is taken and no open Vault is disturbed, so a server can
+        authenticate a second unlock before handing the writer lock over."""
+        master = _passphrase_master(_read_header(Path(path)), passphrase)
+        del master
 
     @classmethod
     def open_with_recovery_key(cls, path: Path, recovery_key: str, *, clock: Callable[[], datetime] | None = None,
@@ -380,6 +381,11 @@ class Vault:
         for index, anchor in enumerate(self._anchors):
             problems += [f"anchor {index}: {e}" for e in assess_anchor(anchor, self.trust_roots).errors]
         self._add_problems(problems)
+        if not any(p.startswith("anchor") for p in self._problems) and len(self._anchors) > self._catalog_anchors:
+            # Anchors appended before a crash that the catalog did not record yet, now
+            # checked: count them from now on.
+            self._catalog_anchors = len(self._anchors)
+            self._save_catalog()  # written now by the writer, else kept dirty in memory
 
     def _add_problems(self, problems: list[str]) -> None:
         for problem in problems:
@@ -457,7 +463,10 @@ class Vault:
             "entries": [e.to_dict() for e in self._entries.values()],
             "licenses": [self._licenses[i].to_dict() for i in self._license_order],
             "royalties": [r.to_dict() for r in self._royalties],
-            "n_anchors": len(self._anchors),
+            # The recorded count, never the number of lines read: it grows only when an
+            # anchor is appended, or once the anchors read at open were checked (see
+            # _check_at_open), so a replay after a crash cannot erase a deletion.
+            "n_anchors": self._catalog_anchors,
         }
 
     def _write_catalog(self) -> None:
@@ -519,15 +528,18 @@ class Vault:
         problems: list[str] = []
         if not anchors_path.exists():
             return anchors, ["anchors.jsonl is missing"] if self._catalog_anchors else []
-        if anchors_path.stat().st_size > MAX_ANCHORS_BYTES:
-            return anchors, [f"anchors.jsonl is larger than {MAX_ANCHORS_BYTES} bytes; not read"]
-        for number, line in enumerate(read_bytes(anchors_path).splitlines()):
+        # A stream of bounded records: a long, valid history stays readable (each anchor
+        # is at most one token), and one oversized line is refused without reading it whole.
+        for number, line in iter_bounded_lines(anchors_path, MAX_ANCHOR_RECORD_BYTES):
+            if line is None:
+                problems.append(f"anchors line {number}: larger than {MAX_ANCHOR_RECORD_BYTES} bytes; not read")
+                continue
             if not line.strip():
                 continue
             try:
                 anchors.append(Anchor.model_validate_json(line))
             except ValueError:
-                problems.append(f"anchors line {number + 1}: unreadable")
+                problems.append(f"anchors line {number}: unreadable")
         return anchors, problems
 
     def _recover(self) -> None:
@@ -901,9 +913,7 @@ class Vault:
         found: list[str] = []
         # header
         try:
-            if (self.path / HEADER).stat().st_size > MAX_HEADER_BYTES:
-                raise ValueError("header too large")
-            disk_header = json.loads(read_bytes(self.path / HEADER))
+            disk_header = json.loads(read_bounded(self.path / HEADER, MAX_HEADER_BYTES))  # TooLarge is a ValueError
             if disk_header != self._header:
                 found.append("header.json on disk differs from the header this vault opened")
             if disk_header.get("public_key") != self._public_hex:
@@ -963,6 +973,8 @@ class Vault:
             if problem not in errors:
                 errors.append(problem)
         self._add_problems(found)
+        if found:
+            self._assessed_cache = None  # a discrepancy: coverage is computed again, from scratch
         head = records[-1].record_hash if records else ZERO_HASH
         return VerifyReport(ok=not errors, n_records=len(records), head_hash=head, signatures_checked=signatures,
                             blobs_checked=blobs, anchors_checked=len(anchors), anchor_status=statuses,
@@ -1239,10 +1251,16 @@ class Vault:
     # ================================================================ catalogue and coverage
 
     def _assessed_anchors(self) -> list:
-        """Anchors that are not invalid, re-checked once per (anchor count, trust roots)."""
+        """Anchors that are not invalid, re-checked whenever the anchors or the content of
+        the trust roots change (a list emptied in place counts as a change). Nothing at all
+        while an anchor problem is listed: then no date is vouched for."""
         from .catalogue import AssessedAnchor
-        # Records are append-only, so an anchor's state can change only with the trust roots.
-        key = (len(self._anchors), id(self.trust_roots))
+        if any(p.startswith("anchor") for p in self._problems):
+            self._assessed_cache = None
+            return []
+        last = self._anchors[-1] if self._anchors else None
+        roots = tuple(cert.fingerprint(hashes.SHA256()) for cert in (self.trust_roots or ()))
+        key = (len(self._anchors), last.seq_upto if last else -1, last.head_hash if last else "", roots)
         cached = getattr(self, "_assessed_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -1299,14 +1317,31 @@ def _set_passphrase(header: dict, master: bytes, passphrase: str, params: KdfPar
                                                            crypto.wrap_aad("passphrase", vault_id, _kdf_aad(kdf)))
 
 
+def _passphrase_master(header: dict, passphrase: str) -> bytes:
+    """The master key, unwrapped with the passphrase; WrongPassphrase otherwise."""
+    vault_id = bytes.fromhex(header["vault_id"])
+    params = KdfParams.from_dict(header["kdf"])  # range-checked before any derivation
+    try:
+        salt = bytes.fromhex(header["kdf"]["salt"])
+        kek = crypto.derive_passphrase_key(passphrase, salt, params)
+        return crypto.unwrap(kek, header["master_key_wraps"]["passphrase"],
+                             crypto.wrap_aad("passphrase", vault_id, _kdf_aad(header["kdf"])))
+    except InvalidTag:
+        raise WrongPassphrase("wrong passphrase") from None
+    except (KeyError, ValueError, TypeError):
+        raise Corrupted("header: malformed passphrase wrap") from None
+
+
 def _read_header(path: Path) -> dict:
     target = path / HEADER
     if not target.exists():
         raise VaultError("no vault in this directory (header.json missing)")
-    if target.stat().st_size > MAX_HEADER_BYTES:
-        raise Corrupted(f"header: larger than {MAX_HEADER_BYTES} bytes")
     try:
-        header = json.loads(read_bytes(target))
+        raw = read_bounded(target, MAX_HEADER_BYTES)  # bounded on the handle, not by a stat beforehand
+    except TooLarge:
+        raise Corrupted(f"header: larger than {MAX_HEADER_BYTES} bytes") from None
+    try:
+        header = json.loads(raw)
         if header["format"] != VAULT_FORMAT:
             raise Corrupted("header: not an Empreinte vault")
         if header["format_version"] != crypto.FORMAT_VERSION:

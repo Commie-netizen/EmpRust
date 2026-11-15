@@ -1,0 +1,32 @@
+Read-only source/test review; no files written and `rust/` excluded. Tests were not run: Python execution was unavailable. Locations reflect the versions read; `vault.py`, `server.py` and web files may shift during the concurrent fixes.
+
+1. **High — Unbounded capture batches.** [watch.py:327](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/src/empreinte/watch.py:327): someone fills a watched folder with thousands of files below the individual size limit. All contents accumulate in memory, then commit under the server’s operation lock, risking memory/disk exhaustion and delaying locking. **Fix:** bound batch bytes, file counts and commit duration; check cancellation between batches and enforce a storage budget.
+
+2. **High — Remembered watches bypass vault exclusions.** [watch.py:209](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/src/empreinte/watch.py:209): the owner moves the vault beneath an already watched folder and reopens it. Loading saved watches never rechecks `forbidden`, so capture can ingest the vault’s changing ledger/blobs and feed itself indefinitely. **Fix:** validate saved folders against the current vault/export locations on load and exclude those locations during scanning.
+
+3. **Medium — Coverage can remain falsely “proven.”** [vault.py:1243](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/src/empreinte/vault.py:1243): after coverage is cached, an integrator clears `trust_roots` in place; its identity remains unchanged, so previously proven coverage survives. Replacing/removing `anchors.jsonl` likewise leaves coverage using old memory, even after verification detects the change. **Fix:** fingerprint trust-root contents and anchor state, detect disk changes, and invalidate coverage on verification discrepancies.
+
+4. **Medium — Registre coverage becomes stale during capture.** [app.js:138](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/src/empreinte/web/js/app.js:138): the owner leaves Registre showing “Tout est couvert”; subsequent captures refresh other views but not this card, so uncovered records remain invisible there. **Fix:** update the card from each status response or refresh Registre on captures.
+
+5. **Medium — Commit accepts obsolete queued work.** [watch.py:348](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/src/empreinte/watch.py:348): the owner removes a watch while its files are being read; those files still commit afterward. Similarly, a manual import can record newer content before a queued older capture commits, making the older content latest again. **Fix:** validate folder generation, source signature and intervening entry changes under the operation lock before each write.
+
+6. **Medium — Different watches can overwrite one logical document.** [watch.py:129](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/src/empreinte/watch.py:129): prefixes `""` and `"Work"` are accepted; `A/Work/x.md` and `B/x.md` then both become `Work/x.md`, mixing unrelated documents into one version history. **Fix:** reject overlapping logical namespaces or track exclusive source ownership of logical paths, including an explicit Windows case policy.
+
+7. **Medium — Ambiguous JSON can verify unchanged.** [verify_bundle.py:1022](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/tools/verify_bundle.py:1022): an attacker inserts a duplicate `summary` before the original. Python keeps the last value, so the original signature still verifies, while a first-value consumer can display the attacker’s summary. **Fix:** reject duplicate keys at every depth; also bound nesting and handle recursion failures explicitly.
+
+8. **Medium — Unrelated bundle still yields overall success.** [verify_bundle.py:1305](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/tools/verify_bundle.py:1305): a licensee checks a valid bundle containing entirely different documents from a valid catalogue signed by the same vault. Individual matches are correctly absent, but exit status remains zero and JSON says `ok: true`. **Fix:** expose a distinct matching verdict and require successful matching when the command is used to validate the catalogue promise.
+
+9. **Medium — Failed export can leave a verifying publication.** [catalogue.py:265](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/src/empreinte/catalogue.py:265): disk failure after writing `catalogue.json` leaves a catalogue that verifies, although auxiliary files, stable-ID persistence or publication history may never complete. **Fix:** stage the directory, persist recoverable publication state, then publish by atomic rename.
+
+10. **Medium — Unreadable folders silently look healthy.** [watch.py:272](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/src/empreinte/watch.py:272): permissions deny enumeration of an existing folder. `_scan()` returns `SkippedFile` errors, which the watcher discards; it clears the folder error and forgets unseen captured state. **Fix:** propagate scan failures and preserve state for unreadable subtrees.
+
+11. **Low — Catalogue wording overstates date proof.** [catalogue.py:61](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/src/empreinte/catalogue.py:61), [licenses.js:83](C:/Users/sawle/OneDrive/Desktop/ChargeGrinder/Empreinte/src/empreinte/web/js/views/licenses.js:83): recipients/owners are told the catalogue proves existence and date even when entries have no authenticated anchor. **Fix:** explicitly condition date proof on a proven anchor and describe summaries as owner assertions.
+
+Checked and found correct in the code read:
+
+- Watch state, publication history and stable public IDs use encrypted vault aux storage; cross-catalogue linkability is documented.
+- Draft previews are rejected; approval binds to the exact version and commitment, including older versions.
+- Export omits unselected title/path/tags and unlisted records’ bodies; signatures cover anchors and optional fields.
+- Record signatures bind the vault key; digest proofs check both anchor head and sequence distance; duplicate IDs/commitments are rejected.
+- Bundle and catalogue tokens share the authentication checker; genuine timestamp results distinguish proven, claimed and unanchored.
+- Session identity checks prevent commits into replaced/closed sessions; page-token-only status responses omit watch details and coverage.

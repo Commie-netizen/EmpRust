@@ -222,7 +222,8 @@ export async function renderNote(root, id, options = {}) {
   if (shown.version !== meta.n_versions) {
     body.appendChild(h("p", { class: "badge badge-warn", text: `Version ${shown.version} sur ${meta.n_versions}, enregistrée le ${fmtDateTime(shown.timestamp)}` }));
   }
-  body.appendChild(bodyFor(text, meta, entry.link_targets, options.pane));
+  // The links of the version displayed (the server resolves them for that text).
+  body.appendChild(bodyFor(text, meta, text.link_targets || entry.link_targets, options.pane));
 
   const links = h("section", {},
     h("h2", { text: "Liens" }),

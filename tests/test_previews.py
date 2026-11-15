@@ -155,3 +155,55 @@ def test_abstract_long_teaser_has_bounded_checks(monkeypatch):
     teaser = _Teaser(**dict(SAFE, keywords=["creativity", "practice", "reflection", "ideas",
                                           "habits", "motivation", "learning", "growth"]))
     assert _validate(teaser, document) == (teaser.summary, teaser.keywords)
+
+
+# --------------------------------------------------- fix round after the closing audit (A9, defect 8)
+
+
+def test_a_repeated_document_word_does_not_forbid_mentioning_it_once():
+    document = "research research research research on soil. " * 3
+    teaser = _Teaser(summary="A note about research methods in general. It stays abstract and private.",
+                     keywords=["research", "methods", "soil"])
+    assert _validate(teaser, document)[0] == teaser.summary
+
+
+def test_a_copied_cjk_sentence_is_refused():
+    document = "我们在山顶的小屋里发现了一封旧信。后来大家都忘了。"
+    teaser = _Teaser(summary="这篇笔记讨论了记忆。我们在山顶的小屋里发现了一封旧信。",
+                     keywords=["记忆", "书信", "旅行"])
+    with pytest.raises(ValueError, match="copies"):
+        _validate(teaser, document)
+
+
+def test_an_abstract_cjk_teaser_is_accepted():
+    document = "我们在山顶的小屋里发现了一封旧信。后来大家都忘了。"
+    teaser = _Teaser(summary="这篇笔记讨论记忆与时间的关系。内容保持抽象和概括。", keywords=["记忆", "时间", "笔记"])
+    assert _validate(teaser, document)[0] == teaser.summary
+
+
+@pytest.mark.parametrize("summary", [
+    "A note mentions co-balt vel-vet fal-con mea-dow cop-per. It stays private.",
+    "A note mentions co\u00adbalt vel\u00advet fal\u00adcon mea\u00addow cop\u00adper. It stays private.",
+    "A note mentions co\u200bbalt vel\u200bvet fal\u200bcon mea\u200bdow cop\u200bper. It stays private.",
+])
+def test_hyphens_inserted_into_document_words_are_seen_through(summary):
+    teaser = _Teaser(summary=summary, keywords=["colour", "animal", "field"])
+    with pytest.raises(ValueError, match="copies"):
+        _validate(teaser, "the cobalt velvet falcon meadow copper story")
+
+
+@pytest.mark.parametrize("summary", [
+    "A personal note quotes the code 48213. It stays private.",
+    "A personal note quotes the number 8213. It stays private.",
+    "A personal note quotes 48 213 somewhere. It stays private.",
+])
+def test_runs_of_four_digits_from_the_document_are_refused(summary):
+    teaser = _Teaser(summary=summary, keywords=["code", "note", "privacy"])
+    with pytest.raises(ValueError, match="digits"):
+        _validate(teaser, "Mon code est 48213 et rien d'autre.")
+
+
+def test_numbers_absent_from_the_document_are_allowed():
+    teaser = _Teaser(summary="A personal note written around 1999 about habits. It stays private.",
+                     keywords=["code", "note", "privacy"])
+    assert _validate(teaser, "Mon code est 48213 et rien d'autre.")[0] == teaser.summary

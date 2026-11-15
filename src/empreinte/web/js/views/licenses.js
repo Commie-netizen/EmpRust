@@ -79,8 +79,8 @@ export async function renderLicenses(root) {
 // proofs, no text. Only entries with an approved preview can be ticked.
 async function renderCatalogue(slot) {
   clear(slot).append(
-    h("p", { class: "muted", text: "À remettre à un licencié potentiel avant toute licence. Pour chaque note choisie : son aperçu approuvé, son nombre de mots, son type de fichier, et la preuve qu'une version précise existait au plus tard à une date, vérifiable sans l'archive. Aucun texte de note n'y figure ; titre, chemin et étiquettes seulement si vous les cochez." }),
-    h("p", { class: "faint", style: { fontSize: "12.5px" }, text: "Un catalogue prouve l'existence et la date d'une version. Il ne prouve ni sa qualité, ni son originalité, ni qui l'a écrite au-delà du détenteur de la clé de cette archive." }),
+    h("p", { class: "muted", text: "À remettre à un licencié potentiel avant toute licence. Pour chaque note choisie : son aperçu approuvé, son nombre de mots, son type de fichier, et les éléments de vérification de sa date, selon son ancrage. Aucun texte de note n'y figure ; titre, chemin et étiquettes seulement si vous les cochez." }),
+    h("p", { class: "faint", style: { fontSize: "12.5px" }, text: "Un catalogue ne prouve une date que pour une entrée avec une ancre prouvée. Une ancre seulement déclarée porte une affirmation d'une autorité non authentifiée. Sans ancre, une entrée ne prouve encore rien sur les dates. Les résumés et mots-clés sont des déclarations du propriétaire, pas des faits vérifiés. Il ne prouve ni sa qualité, ni son originalité, ni qui l'a écrite au-delà du détenteur de la clé de cette archive." }),
     h("p", { class: "muted", text: "Chargement..." }));
   let data;
   try { data = await get("/api/catalogue"); }
