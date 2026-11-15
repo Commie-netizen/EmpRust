@@ -47,6 +47,14 @@
       <input id="tree-filter" type="search" placeholder="Filtrer les fichiers" autocomplete="off" spellcheck="false">
     </div>
     <div class="tree" id="tree" role="tree" aria-label="Arborescence"></div>
+    <div class="watch" id="watch" hidden aria-label="Dossiers suivis">
+      <div class="watch-head">
+        <span class="watch-title">Dossiers suivis</span>
+        <button class="link-btn" id="watch-add">Ajouter</button>
+      </div>
+      <ul class="watch-list" id="watch-list"></ul>
+      <div class="watch-last faint" id="watch-last" aria-live="polite"></div>
+    </div>
     <div class="sidebar-foot">
       <span id="vault-count" class="muted"></span>
       <button class="link-btn" id="import-btn" hidden>Importer un dossier</button>

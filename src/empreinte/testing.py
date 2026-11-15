@@ -17,6 +17,9 @@ from typing import Callable, Literal, Sequence
 from .api import NotFound, VaultError
 from .model import (
     Anchor,
+    CatalogueChoice,
+    CataloguePublication,
+    Coverage,
     EntryKind,
     EntryMeta,
     LedgerRecord,
@@ -266,6 +269,31 @@ class InMemoryVault:
     def royalties(self, license_id: str | None = None) -> list[RoyaltyEvent]:
         self._check()
         return [e for e in self._royalties if license_id is None or e.license_id == license_id]
+
+    # ------------------------------------------------------- public catalogue
+    def _catalogue_anchors(self) -> list:
+        """Anchors usable in a catalogue: none here (no real tokens)."""
+        return []
+
+    def export_catalogue(self, items: Sequence[CatalogueChoice], out_dir: Path) -> CataloguePublication:
+        """Same selection and leak rules as the real vault; unsigned, with no chain proof."""
+        from . import catalogue
+        from .ledger import chain_digests
+        self._check()
+        ledger = self._ledger
+        return catalogue.export(self, items, Path(out_dir), public_key="", records=ledger,
+                                anchors=self._catalogue_anchors(), sign=None,
+                                digests=lambda first, last: chain_digests(ledger[:last + 1], "", first))
+
+    def catalogues(self) -> list[CataloguePublication]:
+        from .catalogue import publications
+        self._check()
+        return publications(self)
+
+    def coverage(self) -> Coverage:
+        from .catalogue import coverage_of
+        self._check()
+        return coverage_of(self._ledger, self._catalogue_anchors())
 
     # ---------------------------------------------------- encrypted side storage
     def aux_get(self, key: str) -> bytes | None:

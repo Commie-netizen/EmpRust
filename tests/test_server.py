@@ -246,7 +246,8 @@ def test_status_without_unlock(srv):
     status, body, headers = srv.call("GET", "/api/status")
     assert status == 200
     assert body["exists"] is True and body["unlocked"] is False
-    assert body["features"] == {"import": True, "previews": True, "export": True, "anchor_methods": []}
+    assert body["features"] == {"import": True, "previews": True, "export": True, "watch": False,
+                                "anchor_methods": []}
     assert headers["cache-control"] == "no-store"
 
 
@@ -591,7 +592,7 @@ def test_features_off(tmp_path):
     h = Harness(session_for(vault, with_extras=False), vault)
     try:
         assert h.call("GET", "/api/status")[1]["features"] == {"import": False, "previews": False, "export": False,
-                                                                "anchor_methods": []}
+                                                                "watch": False, "anchor_methods": []}
         h.unlock()
         idee = ids(h)["Recherche/idee.md"]
         assert h.call("POST", "/api/previews", {"entry_ids": [idee]})[1]["error"] == "feature_off"

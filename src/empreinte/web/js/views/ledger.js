@@ -62,10 +62,15 @@ export async function renderLedger(root) {
       h("span", { class: "muted", text: "Aucun horodatage extérieur n'est disponible pour cette archive." })), report);
   }
 
+  const coverageSlot = h("div", { "aria-live": "polite" });
   const anchorsSlot = h("div");
   const tableSlot = h("div");
-  inner.append(h("h2", { text: "Ancres externes" }), anchorsSlot, h("h2", { text: "Enregistrements" }), tableSlot);
+  inner.append(h("h2", { text: "Ancres externes" }), coverageSlot, anchorsSlot, h("h2", { text: "Enregistrements" }), tableSlot);
 
+  try {
+    const s = await get("/api/status");
+    if (s.coverage) coverageSlot.appendChild(coverageCard(s.coverage));
+  } catch (err) { if (ended(err)) return; }
   try {
     const anchors = await get("/api/anchors");
     if (!anchors.length) anchorsSlot.appendChild(h("p", { class: "faint", text: "Aucune ancre : les dates reposent seulement sur le registre local." }));
@@ -79,6 +84,22 @@ export async function renderLedger(root) {
         h("td", { class: "mono", title: a.head_hash, text: short(a.head_hash, 12) })))))));
   } catch (err) { if (ended(err)) return; anchorsSlot.appendChild(h("p", { class: "error", text: err.message })); }
   await renderPage(tableSlot);
+}
+
+/** How many records no proven anchor covers yet, and since when the oldest waits. */
+export function coverageCard(c) {
+  if (!c.n_records) return h("p", { class: "faint", text: "Registre vide." });
+  if (!c.uncovered) {
+    return h("div", { class: "card coverage" }, h("span", { class: "badge badge-ok", text: "Tout est couvert" }),
+      h("span", { class: "muted", text: `Les ${c.n_records} enregistrements sont couverts par une ancre authentifiée : leur date est vérifiable par un tiers.` }));
+  }
+  const plural = c.uncovered > 1;
+  return h("div", { class: "card coverage" },
+    h("span", { class: "badge badge-warn", text: `${c.uncovered} non couvert${plural ? "s" : ""}` }),
+    h("span", { class: "muted", text: `${c.uncovered} enregistrement${plural ? "s" : ""} sur ${c.n_records} ${plural ? "ne sont couverts" : "n'est couvert"} par aucune ancre authentifiée`
+      + (c.covered_upto >= 0 ? ` (ancres prouvées jusqu'à la séquence ${c.covered_upto})` : "")
+      + `. Le plus ancien attend depuis le ${fmtDateTime(c.oldest_uncovered_at)} (date du registre local). Leur date ne repose que sur l'horloge de cette machine jusqu'au prochain ancrage.` }),
+    c.claimed_upto > c.covered_upto ? h("span", { class: "faint", text: `Une ancre non authentifiée couvre jusqu'à la séquence ${c.claimed_upto} : c'est une déclaration, pas une preuve.` }) : null);
 }
 
 async function renderPage(slot) {

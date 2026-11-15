@@ -7,6 +7,15 @@ An older cryptography is refused with a clear message (exit status 2): 45 added 
 certificate path validation used here, 49 fixed a path-building denial of service.
 
     python verify_bundle.py BUNDLE_DIR [--tsa-ca ROOT.pem ...] [--json]
+    python verify_bundle.py --catalogue CATALOGUE [--tsa-ca ROOT.pem ...] [--json]
+    python verify_bundle.py BUNDLE_DIR --catalogue CATALOGUE      (also: which item is which entry)
+
+CATALOGUE is a catalogue directory or its catalogue.json. For a public catalogue it
+checks the signature of the whole list by the vault key, each entry's ledger record and
+its signature, the digests chaining that record to an anchored record, and that anchor's
+token, then prints per entry the date from which its existence is proven (or that it is
+only claimed, or not yet provable). Given a bundle too, it says which licensed item is
+the same document as which catalogue entry (same key, commitment and ledger record).
 
 For the grant and for each licensed item it checks, from the bundle alone:
   * the content matches the commitment in the ledger record: SHA-256(salt || content);
@@ -746,6 +755,28 @@ def salted_hash(salt: bytes, bundle: Path, name: object, limit: int) -> str:
 # ========================================================================= bundle
 
 
+def assess_anchor_token(index: int, anchor: dict, roots: list[x509.Certificate]) -> dict:
+    """Check one anchor's token against its own head hash (the checks of check_token, plus
+    anchored_at equal to genTime). Where the head hash sits is the caller's business.
+    Returns {index, seq_upto, authority, gen_time, signer, state, trust_error, problems}."""
+    problems: list[str] = []
+    try:
+        proof = anchor["proof"]
+        if not isinstance(proof, str) or len(proof) > MAX_PROOF_CHARS:
+            raise ValueError("proof too large")
+        token = base64.b64decode(proof, validate=True)
+    except (ValueError, TypeError, KeyError):
+        token = b""
+    check = check_token(token, hexbytes(anchor.get("head_hash"), 32, "anchor hash"), trust_roots=roots)
+    problems += check.errors
+    if check.gen_time and anchor.get("anchored_at") and \
+            datetime.fromisoformat(str(anchor["anchored_at"]).replace("Z", "+00:00")) != check.gen_time:
+        problems.append("anchored_at differs from the time in the token")
+    return {"index": index, "seq_upto": anchor.get("seq_upto"), "authority": str(anchor.get("authority", ""))[:200],
+            "gen_time": check.gen_time, "signer": check.signer, "state": "invalid" if problems else check.state,
+            "trust_error": check.trust_error, "problems": problems}
+
+
 @dataclass
 class Verdict:
     name: str
@@ -805,23 +836,12 @@ def verify(bundle: Path, roots: list[x509.Certificate]) -> dict:
         problems = []
         if type(seq) is not int or seq < first or hashes_by_seq.get(seq) != anchor["head_hash"]:
             problems.append("its head hash is not on the disclosed chain")
-        try:
-            proof = anchor["proof"]
-            if not isinstance(proof, str) or len(proof) > MAX_PROOF_CHARS:
-                raise ValueError("proof too large")
-            token = base64.b64decode(proof, validate=True)
-        except (ValueError, TypeError):
-            token = b""
-        check = check_token(token, hexbytes(anchor["head_hash"], 32, "anchor hash"), trust_roots=roots)
-        problems += check.errors
-        if check.gen_time and anchor.get("anchored_at") and \
-                datetime.fromisoformat(str(anchor["anchored_at"]).replace("Z", "+00:00")) != check.gen_time:
-            problems.append("anchored_at differs from the time in the token")
-        state = "invalid" if problems else check.state
-        anchors.append({"index": index, "seq_upto": seq, "authority": str(anchor.get("authority", ""))[:200],
-                        "gen_time": check.gen_time, "signer": check.signer, "state": state,
-                        "trust_error": check.trust_error, "problems": problems})
-        for problem in problems:
+        assessed = assess_anchor_token(index, anchor, roots)
+        assessed["problems"] = problems + assessed["problems"]
+        if assessed["problems"]:
+            assessed["state"] = "invalid"
+        anchors.append(assessed)
+        for problem in assessed["problems"]:
             general.append(f"anchor {index} (record {seq}): {problem}")
 
     def check_record(verdict: Verdict, record: dict, kind: str) -> None:
@@ -973,13 +993,291 @@ def _summary(verdict: Verdict) -> dict:
             "problems": verdict.problems}
 
 
+# ===================================================================== catalogue
+# A public catalogue (docs/FORMAT.md of Empreinte, section 15): approved summaries and,
+# per entry, the signed ledger record of the exact version and the body digests that
+# chain it to an anchored record. No document is in it.
+
+CATALOGUE_PREFIX = b"empreinte/v1/catalogue\x00"
+MAX_CATALOGUE_BYTES = 64 << 20
+MAX_CATALOGUE_ENTRIES = 100_000
+CATALOGUE_FIELDS = {"format", "format_version", "catalogue_id", "public_key", "exported_at", "statement",
+                    "entries", "anchors", "signature"}
+ENTRY_FIELDS = {"public_id", "media_type", "words", "summary", "keywords", "commitment", "record", "proof"}
+ENTRY_OPTIONAL = {"title", "path", "tags"}
+ANCHOR_FIELDS = {"seq_upto", "head_hash", "method", "authority", "anchored_at", "proof", "file"}
+
+
+def catalogue_canonical(document: dict) -> bytes:
+    """The signed bytes: canonical JSON (sorted keys, no whitespace, UTF-8) without "signature"."""
+    body = {k: v for k, v in document.items() if k != "signature"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def load_catalogue(path: Path) -> dict:
+    """A catalogue directory (its catalogue.json) or the JSON file itself, bounded and checked."""
+    path = Path(path)
+    data = read_bundle_file(path, "catalogue.json", MAX_CATALOGUE_BYTES) if path.is_dir() else \
+        read_bundle_file(path.parent, path.name, MAX_CATALOGUE_BYTES)
+    document = json.loads(data.decode("utf-8"))
+    if not isinstance(document, dict) or document.get("format") != "empreinte-catalogue" \
+            or document.get("format_version") != 1:
+        raise BundleError("not an Empreinte catalogue of format version 1")
+    if set(document) != CATALOGUE_FIELDS:
+        raise BundleError("catalogue has the wrong set of fields")
+    if not isinstance(document["entries"], list) or len(document["entries"]) > MAX_CATALOGUE_ENTRIES:
+        raise BundleError("catalogue entries is not a list of a reasonable size")
+    if not isinstance(document["anchors"], list) or len(document["anchors"]) > MAX_CATALOGUE_ENTRIES:
+        raise BundleError("catalogue anchors is not a list of a reasonable size")
+    return document
+
+
+@dataclass
+class EntryVerdict:
+    public_id: str
+    title: str = ""
+    seq: int = -1
+    words: object = None
+    media_type: str = ""
+    commitment: str = ""
+    record_hash: str = ""
+    signed_ok: bool = False
+    chained_ok: bool | None = None  # None: no proof given (not yet provable)
+    ledger_time: str = ""
+    timestamp: str = "none"  # "none", "claimed" or "proven"
+    proven_before: datetime | None = None
+    proven_by: str = ""
+    claimed_before: datetime | None = None
+    claimed_by: str = ""
+    claim_reason: str = ""
+    problems: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.signed_ok and self.chained_ok is not False and not self.problems
+
+
+def _text(value: object, limit: int) -> bool:
+    return isinstance(value, str) and len(value) <= limit
+
+
+def verify_catalogue(path: Path, roots: list[x509.Certificate]) -> dict:
+    """Check a catalogue; return a report dict (see render_catalogue)."""
+    document = load_catalogue(path)
+    general: list[str] = []
+    key_hex = document["public_key"]
+    try:
+        key = ed25519.Ed25519PublicKey.from_public_bytes(hexbytes(key_hex, 32, "public key"))
+    except BundleError:
+        raise BundleError("the catalogue has no valid vault public key (unsigned test catalogue?)") from None
+    signature_ok = signed(key, document["signature"], CATALOGUE_PREFIX + catalogue_canonical(document))
+    if not signature_ok:
+        general.append("the catalogue signature by the vault key is invalid: something was changed after signing")
+    for name in ("catalogue_id", "exported_at", "statement"):
+        if not _text(document[name], 4000):
+            general.append(f"catalogue field {name} is not text")
+
+    anchors = []
+    for index, anchor in enumerate(document["anchors"]):
+        if not isinstance(anchor, dict) or set(anchor) != ANCHOR_FIELDS or type(anchor.get("seq_upto")) is not int:
+            anchors.append({"index": index, "seq_upto": None, "state": "invalid", "gen_time": None, "signer": "",
+                            "authority": "", "trust_error": "", "problems": ["anchor has the wrong fields"]})
+        else:
+            try:
+                anchors.append(assess_anchor_token(index, anchor, roots))
+            except BundleError as exc:
+                anchors.append({"index": index, "seq_upto": anchor["seq_upto"], "state": "invalid", "gen_time": None,
+                                "signer": "", "authority": "", "trust_error": "", "problems": [str(exc)]})
+        for problem in anchors[-1]["problems"]:
+            general.append(f"anchor {index}: {problem}")
+
+    verdicts: list[EntryVerdict] = []
+    seen_ids: set[str] = set()
+    seen_commitments: set[str] = set()
+    for number, entry in enumerate(document["entries"], start=1):
+        if not isinstance(entry, dict):
+            verdict = EntryVerdict(public_id=f"#{number}")
+            verdict.problems.append("entry is not an object")
+            verdicts.append(verdict)
+            continue
+        verdict = EntryVerdict(public_id=str(entry.get("public_id"))[:64])
+        verdicts.append(verdict)
+        fields = set(entry)
+        if not ENTRY_FIELDS <= fields or not fields - ENTRY_FIELDS <= ENTRY_OPTIONAL:
+            verdict.problems.append("entry has the wrong set of fields")
+            continue
+        try:
+            hexbytes(entry["public_id"], 16, "public id")
+            hexbytes(entry["commitment"], 32, "commitment")
+        except BundleError as exc:
+            verdict.problems.append(str(exc))
+        if type(entry["words"]) is not int or entry["words"] < 0:
+            verdict.problems.append("words is not a non-negative integer")
+        if not _text(entry["summary"], 10000) or not _text(entry["media_type"], 200):
+            verdict.problems.append("summary or media_type is not text")
+        if not isinstance(entry["keywords"], list) or not all(_text(k, 200) for k in entry["keywords"]):
+            verdict.problems.append("keywords is not a list of text")
+        if "title" in entry and not _text(entry["title"], 2000):
+            verdict.problems.append("title is not text")
+        if "path" in entry and not _text(entry["path"], 4000):
+            verdict.problems.append("path is not text")
+        if "tags" in entry and (not isinstance(entry["tags"], list) or not all(_text(t, 200) for t in entry["tags"])):
+            verdict.problems.append("tags is not a list of text")
+        verdict.title = str(entry.get("title", ""))[:200]
+        verdict.words, verdict.media_type = entry["words"], str(entry["media_type"])[:200]
+        verdict.commitment = str(entry["commitment"])
+        if str(entry["public_id"]) in seen_ids:
+            verdict.problems.append("this public id appears twice")
+        if str(entry["commitment"]) in seen_commitments:
+            verdict.problems.append("this commitment appears twice")
+        seen_ids.add(str(entry["public_id"]))
+        seen_commitments.add(str(entry["commitment"]))
+
+        record = entry["record"]
+        try:
+            body = canonical_body(record, key_hex)
+            prev = hexbytes(record["prev_hash"], 32, "prev_hash")
+        except BundleError as exc:
+            verdict.problems.append(str(exc))
+            continue
+        verdict.seq, verdict.ledger_time = record["seq"], record["timestamp"]
+        if record["kind"] != "put":
+            verdict.problems.append(f"record {record['seq']} is of kind {record['kind']}, expected put")
+        if record["commitment"] != entry["commitment"]:
+            verdict.problems.append("the record is about another commitment")
+        record_hash = hashlib.sha256(prev + hashlib.sha256(body).digest()).hexdigest()
+        verdict.record_hash = record_hash
+        verdict.signed_ok = record_hash == record["record_hash"] and signed(
+            key, record["signature"], RECORD_PREFIX + bytes.fromhex(record_hash))
+
+        proof = entry["proof"]
+        if proof is None:
+            continue
+        verdict.chained_ok = False
+        if not isinstance(proof, dict) or set(proof) != {"anchor", "body_digests"} \
+                or type(proof["anchor"]) is not int or not isinstance(proof["body_digests"], list) \
+                or not 0 <= proof["anchor"] < len(anchors):
+            verdict.problems.append("proof is malformed or names no anchor of this catalogue")
+            continue
+        anchor = anchors[proof["anchor"]]
+        try:
+            current = bytes.fromhex(record_hash)
+            for digest in proof["body_digests"]:
+                current = hashlib.sha256(current + hexbytes(digest, 32, "body digest")).digest()
+        except BundleError as exc:
+            verdict.problems.append(str(exc))
+            continue
+        head = document["anchors"][proof["anchor"]]
+        verdict.chained_ok = (verdict.signed_ok and anchor["seq_upto"] == record["seq"] + len(proof["body_digests"])
+                              and isinstance(head, dict) and current.hex() == head.get("head_hash"))
+        if not verdict.chained_ok:
+            verdict.problems.append("the digests do not lead from this record to its anchor's head hash")
+            continue
+        if anchor["state"] == "invalid":
+            verdict.problems.append(f"its anchor {proof['anchor']} is invalid")
+        elif anchor["state"] == "proven":
+            verdict.timestamp, verdict.proven_before, verdict.proven_by = "proven", anchor["gen_time"], anchor["signer"]
+        else:
+            verdict.timestamp, verdict.claimed_before = "claimed", anchor["gen_time"]
+            verdict.claimed_by, verdict.claim_reason = anchor["authority"], anchor["trust_error"]
+
+    ok = signature_ok and not general and all(v.ok for v in verdicts)
+    return {"ok": ok, "document": document, "signature_ok": signature_ok, "entries": verdicts,
+            "anchors": anchors, "general": general, "roots": len(roots)}
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def render_catalogue(report: dict) -> str:
+    document = report["document"]
+    roots = report["roots"]
+    lines = ["Empreinte catalogue verification", "",
+             f"Catalogue {str(document.get('catalogue_id'))[:64]}, exported {str(document.get('exported_at'))[:40]} "
+             "(author's clock)",
+             f"Vault key (Ed25519): {document['public_key']}",
+             f"Catalogue signed by this key: {_yes(report['signature_ok'])}",
+             f"Timestamp trust roots: {roots} certificate(s)" if roots else
+             "Timestamp trust roots: none (give --tsa-ca or install certifi); timestamps can only be claims",
+             f"{len(report['entries'])} entries. What this proves: {str(document.get('statement'))[:2000]}", ""]
+    for verdict in report["entries"]:
+        name = f'entry {verdict.public_id}' + (f' "{verdict.title}"' if verdict.title else "")
+        lines.append(f"{name}: {'OK' if verdict.ok else 'FAILED'}")
+        lines.append(f"  record {verdict.seq} signed by this key: {_yes(verdict.signed_ok)}")
+        lines.append(f"  commitment {verdict.commitment[:64]}, {verdict.words} words, {verdict.media_type}")
+        if verdict.timestamp == "proven":
+            lines.append(f"  PROVEN FROM {verdict.proven_before.isoformat()}: the document existed no later than "
+                         f"this date (authenticated authority: {verdict.proven_by})")
+        elif verdict.timestamp == "claimed":
+            lines.append(f"  CLAIMED ONLY: existence by {verdict.claimed_before.isoformat()} is asserted by an "
+                         f"authority that could not be authenticated ({verdict.claim_reason}); it names itself "
+                         f"{verdict.claimed_by}")
+        elif verdict.chained_ok is None:
+            lines.append(f"  NOT YET PROVABLE TO A THIRD PARTY: no outside timestamp covers it; recorded "
+                         f"{verdict.ledger_time} by the author's own clock (proves order, not date)")
+        for problem in verdict.problems:
+            lines.append(f"  problem: {problem}")
+    for problem in report["general"]:
+        lines.append(f"problem: {problem}")
+    lines += ["", "VERDICT: " + ("ALL CHECKS PASSED" if report["ok"] else "FAILED")]
+    return "\n".join(lines) + "\n"
+
+
+def _entry_summary(verdict: EntryVerdict) -> dict:
+    return {"public_id": verdict.public_id, "ok": verdict.ok, "signed": verdict.signed_ok,
+            "chained": verdict.chained_ok, "seq": verdict.seq, "commitment": verdict.commitment,
+            "timestamp": {"state": verdict.timestamp, "proven_before": _iso(verdict.proven_before),
+                          "proven_by": verdict.proven_by or None, "claimed_before": _iso(verdict.claimed_before),
+                          "claimed_by": verdict.claimed_by or None, "ledger_time": verdict.ledger_time},
+            "problems": verdict.problems}
+
+
+def match_bundle(bundle_report: dict, catalogue_report: dict) -> dict:
+    """Which bundle item is which catalogue entry: same vault key, same commitment and
+    same ledger record. Only verified items and entries are matched."""
+    same_key = bundle_report["manifest"].get("public_key") == catalogue_report["document"].get("public_key")
+    by_commitment = {v.commitment: v for v in catalogue_report["entries"] if v.ok}
+    matches = []
+    for item, verdict in zip(bundle_report["manifest"]["items"], bundle_report["items"]):
+        record = item.get("record", {}) if isinstance(item, dict) else {}
+        entry = by_commitment.get(record.get("commitment")) if same_key and verdict.ok else None
+        if entry is not None and (entry.seq, entry.record_hash) != (record.get("seq"), record.get("record_hash")):
+            entry = None
+        matches.append({"item": verdict.name, "public_id": entry.public_id if entry else None})
+    return {"same_key": same_key, "matches": matches}
+
+
+def _bundle_json(report: dict) -> dict:
+    return {"ok": report["ok"], "trust_roots": report["roots"], "general": report["general"],
+            "items": [_summary(v) for v in [report["grant_verdict"]] + report["items"]],
+            "anchors": [{"index": a["index"], "seq_upto": a["seq_upto"], "state": a["state"],
+                         "time": a["gen_time"].isoformat() if a["gen_time"] else None,
+                         "signer": a["signer"], "trust_error": a["trust_error"] or None,
+                         "problems": a["problems"]} for a in report["anchors"]]}
+
+
+def _catalogue_json(report: dict) -> dict:
+    return {"ok": report["ok"], "signature": report["signature_ok"], "trust_roots": report["roots"],
+            "general": report["general"], "entries": [_entry_summary(v) for v in report["entries"]],
+            "anchors": [{"index": a["index"], "seq_upto": a["seq_upto"], "state": a["state"],
+                         "time": _iso(a["gen_time"]), "signer": a["signer"], "problems": a["problems"]}
+                        for a in report["anchors"]]}
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Verify an Empreinte disclosure bundle.")
-    parser.add_argument("bundle", type=Path)
+    parser = argparse.ArgumentParser(
+        description="Verify an Empreinte disclosure bundle, a public catalogue, or that a bundle's items are "
+                    "entries of a catalogue (give both).")
+    parser.add_argument("bundle", type=Path, nargs="?")
+    parser.add_argument("--catalogue", type=Path, default=None,
+                        help="a catalogue directory or its catalogue.json")
     parser.add_argument("--tsa-ca", action="append", default=[], type=Path,
                         help="PEM file of a trusted timestamp authority root (repeatable); replaces certifi")
     parser.add_argument("--json", action="store_true", help="print a JSON summary")
     args = parser.parse_args(argv)
+    if args.bundle is None and args.catalogue is None:
+        parser.error("give a bundle directory, --catalogue PATH, or both")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # titles are Unicode, whatever the code page
     try:
@@ -987,21 +1285,51 @@ def main(argv: list[str] | None = None) -> int:
             roots = [cert for path in args.tsa_ca for cert in x509.load_pem_x509_certificates(path.read_bytes())]
         else:
             roots = list(default_trust_roots())
-        report = verify(args.bundle, roots)
+    except (OSError, ValueError) as exc:
+        print(f"cannot read the trust roots: {exc}", file=sys.stderr)
+        return 2
+    report = catalogue = None
+    try:
+        if args.bundle is not None:
+            report = verify(args.bundle, roots)
     except (OSError, ValueError, KeyError, TypeError, AttributeError, BundleError) as exc:
         print(f"cannot read the bundle: {exc}", file=sys.stderr)
         return 2
+    try:
+        if args.catalogue is not None:
+            catalogue = verify_catalogue(args.catalogue, roots)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, BundleError) as exc:
+        print(f"cannot read the catalogue: {exc}", file=sys.stderr)
+        return 2
+    matched = match_bundle(report, catalogue) if report is not None and catalogue is not None else None
+    ok = (report is None or report["ok"]) and (catalogue is None or catalogue["ok"]) \
+        and (matched is None or matched["same_key"])
     if args.json:
-        summary = {"ok": report["ok"], "trust_roots": report["roots"], "general": report["general"],
-                   "items": [_summary(v) for v in [report["grant_verdict"]] + report["items"]],
-                   "anchors": [{"index": a["index"], "seq_upto": a["seq_upto"], "state": a["state"],
-                                "time": a["gen_time"].isoformat() if a["gen_time"] else None,
-                                "signer": a["signer"], "trust_error": a["trust_error"] or None,
-                                "problems": a["problems"]} for a in report["anchors"]]}
+        if catalogue is None:
+            summary = _bundle_json(report)
+        elif report is None:
+            summary = _catalogue_json(catalogue)
+        else:
+            summary = {"ok": ok, "bundle": _bundle_json(report), "catalogue": _catalogue_json(catalogue),
+                       "same_key": matched["same_key"], "matches": matched["matches"]}
         print(json.dumps(summary, indent=2, ensure_ascii=False))
-    else:
+        return 0 if ok else 1
+    if report is not None:
         sys.stdout.write(render(report))
-    return 0 if report["ok"] else 1
+    if catalogue is not None:
+        if report is not None:
+            sys.stdout.write("\n")
+        sys.stdout.write(render_catalogue(catalogue))
+    if matched is not None:
+        lines = ["", "Bundle items and catalogue entries"]
+        if not matched["same_key"]:
+            lines.append("problem: the bundle and the catalogue are signed by different vault keys")
+        for match in matched["matches"]:
+            lines.append(f"{match['item']}: " + (f"same document as catalogue entry {match['public_id']}"
+                                                 if match["public_id"] else "NOT an entry of this catalogue"))
+        lines += ["", "VERDICT: " + ("ALL CHECKS PASSED" if ok else "FAILED")]
+        sys.stdout.write("\n".join(lines) + "\n")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

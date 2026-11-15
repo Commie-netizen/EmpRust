@@ -30,13 +30,18 @@ ancrage reste une action explicite de l'utilisateur.
 Codex ne lance Python que via `C:/Users/sawle/.codex-py` (`--add-dir`, PYTHONPATH=site;src).
 Gemini : la CLI refuse le compte individuel ; il faut une clé `GEMINI_API_KEY`.
 
+Lot suivant (même jour) : capture continue (`watch.py`, `empreinte watch`, suivi dans le
+serveur), catalogue public (`catalogue.py`, `verify_bundle.py --catalogue`, FORMAT.md
+section 15), enregistrements non couverts (`coverage()`, `/api/status`, vue Registre).
+
 ## Optimisation du contexte
 
 - Ouvrir cette fiche, puis chercher le symbole/la fonctionnalité avec `rg`.
 - Contrats : `src/empreinte/api.py`, `model.py`, `tests/vault_contract.py`.
 - Coffre/registre : `vault.py`, `store.py`, `ledger.py`, `crypto.py`.
 - Horodatage/licences : `anchor.py`, `licensing.py`, `tools/verify_bundle.py`.
-- Lecture/import : `workspace.py`, `parse.py`, `search.py`, `importer.py`.
+- Lecture/import : `workspace.py`, `parse.py`, `search.py`, `importer.py`, `watch.py`.
+- Catalogue public : `catalogue.py` (partagé par `vault.py` et `testing.py`).
 - Modèle/aperçus : `context.py`, `previews.py`, `localllm.py` ; tests `test_context.py`.
 - Application : `server.py`, `cli.py`, `web/js/app.js`, `web/js/api.js`, `reader.js`.
 

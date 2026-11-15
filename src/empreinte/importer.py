@@ -5,6 +5,7 @@ modification, but do not provide a coherent snapshot guarantee.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
 import os
@@ -159,17 +160,82 @@ def _open_source(root: Path, relative: str) -> int:
         raise
 
 
+class TooLarge(Exception):
+    """The source holds more than max_bytes once read."""
+
+
+def read_source(root: Path, source: SourceFile, max_bytes: int) -> tuple[bytes, os.stat_result]:
+    """Read one scanned file, refusing links and unstable reads.
+
+    Re-checks containment and links just before opening, bounds the read, and accepts
+    the content only when two reads agree with each other and with the file metadata.
+    Raises OSError (unstable, moved, link) or TooLarge. Returns the content and the
+    fstat taken after the confirming read.
+    """
+    parts = source.path.relative_to(root).parts
+    current = root
+    info = None
+    for part in parts:
+        current = current / part
+        info = current.lstat()
+        if current.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise OSError("source changed to a link")
+    if not source.path.resolve(strict=True).is_relative_to(root):
+        raise OSError("source moved outside root")
+    expected = info
+    fd = _open_source(root, source.relative_path)
+    with os.fdopen(fd, "rb", buffering=0) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("source is no longer a regular file")
+        if (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino):
+            raise OSError("source changed while opening")
+        for attempt in range(4):  # Initial read and up to three retries.
+            if attempt:
+                stream.seek(0)
+                info = os.fstat(stream.fileno())
+            content = stream.read(max_bytes + 1)
+            after = os.fstat(stream.fileno())
+            if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) == (
+                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                stream.seek(0)
+                confirmation = stream.read(max_bytes + 1)
+                confirmed = os.fstat(stream.fileno())
+                if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == (
+                        confirmed.st_dev, confirmed.st_ino, confirmed.st_size, confirmed.st_mtime_ns
+                ) and hashlib.sha256(content).digest() == hashlib.sha256(confirmation).digest():
+                    break
+        else:
+            raise OSError("unstable during read")
+    if len(content) > max_bytes:
+        raise TooLarge(source.relative_path)
+    return content, confirmed
+
+
+def put_source(vault: VaultAPI, logical: str, source: SourceFile, content: bytes, info: os.stat_result):
+    """Record content read from `source` at `logical`, the file date as claimed time."""
+    doc = parse_document(content.decode("utf-8-sig", errors="replace") if is_text(source.media_type) else "",
+                         path=logical, media_type=source.media_type)
+    return vault.put(logical, content, title=doc.title, tags=doc.tags, kind=source.kind,
+                     media_type=source.media_type, source_mtime=datetime.fromtimestamp(info.st_mtime, timezone.utc))
+
+
+def check_prefix(prefix: str) -> str:
+    """Normalise a logical folder prefix; raise ValueError if it is not relative."""
+    prefix = prefix.replace("\\", "/").strip("/")
+    if any(part in {"..", "."} for part in prefix.split("/")) or ":" in prefix:
+        raise ValueError("prefix must be a relative logical folder")
+    return prefix
+
+
 def sync_folder(vault: VaultAPI, root: Path, *, prefix: str = "", max_bytes: int = 20_000_000) -> ImportReport:
     """Import changed content and retain an encrypted manifest for missing files."""
     started = time.perf_counter()
     root = Path(root).resolve(strict=True)
-    prefix = prefix.replace("\\", "/").strip("/")
-    if any(part in {"..", "."} for part in prefix.split("/")) or ":" in prefix:
-        raise ValueError("prefix must be a relative logical folder")
+    prefix = check_prefix(prefix)
     if max_bytes < 0:
         raise ValueError("max_bytes must be nonnegative")
     # Root paths are private; aux storage encrypts the manifest and its key.
-    import hashlib
     key = "import/" + hashlib.sha256((str(root) + "\0" + prefix).encode("utf-8")).hexdigest()
     old = vault.aux_get(key)
     previous = set(json.loads(old)) if old else set()
@@ -188,53 +254,16 @@ def sync_folder(vault: VaultAPI, root: Path, *, prefix: str = "", max_bytes: int
                 report.skipped.append(SkippedFile(logical, "exceeds max_bytes"))
                 continue
             try:
-                # Re-check containment and links just before opening, and bound reads.
-                parts = source.path.relative_to(root).parts
-                current = root
-                for part in parts:
-                    current = current / part
-                    info = current.lstat()
-                    if current.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
-                        raise OSError("source changed to a link")
-                if not source.path.resolve(strict=True).is_relative_to(root):
-                    raise OSError("source moved outside root")
-                expected = info
-                fd = _open_source(root, source.relative_path)
-                with os.fdopen(fd, "rb", buffering=0) as stream:
-                    info = os.fstat(stream.fileno())
-                    if not stat.S_ISREG(info.st_mode):
-                        raise OSError("source is no longer a regular file")
-                    if (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino):
-                        raise OSError("source changed while opening")
-                    for attempt in range(4):  # Initial read and up to three retries.
-                        if attempt:
-                            stream.seek(0)
-                            info = os.fstat(stream.fileno())
-                        content = stream.read(max_bytes + 1)
-                        after = os.fstat(stream.fileno())
-                        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) == (
-                                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
-                            stream.seek(0)
-                            confirmation = stream.read(max_bytes + 1)
-                            confirmed = os.fstat(stream.fileno())
-                            if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == (
-                                    confirmed.st_dev, confirmed.st_ino, confirmed.st_size, confirmed.st_mtime_ns
-                            ) and hashlib.sha256(content).digest() == hashlib.sha256(confirmation).digest():
-                                break
-                    else:
-                        raise OSError("unstable during read")
-                if len(content) > max_bytes:
-                    report.skipped.append(SkippedFile(logical, "exceeds max_bytes"))
-                    continue
+                content, info = read_source(root, source, max_bytes)
+            except TooLarge:
+                report.skipped.append(SkippedFile(logical, "exceeds max_bytes"))
+                continue
             except OSError as exc:
                 report.skipped.append(SkippedFile(logical, str(exc)))
                 continue
-            doc = parse_document(content.decode("utf-8-sig", errors="replace") if is_text(source.media_type) else "",
-                                 path=logical, media_type=source.media_type)
             existing = vault.find(logical)
             before = existing.n_versions if existing else 0
-            version = vault.put(logical, content, title=doc.title, tags=doc.tags, kind=source.kind,
-                media_type=source.media_type, source_mtime=datetime.fromtimestamp(info.st_mtime, timezone.utc))
+            version = put_source(vault, logical, source, content, info)
             if not before:
                 report.added += 1
             elif version.version > before:

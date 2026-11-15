@@ -16,6 +16,9 @@ from typing import Literal, Protocol, Sequence, runtime_checkable
 from .model import (
     Activity,
     Anchor,
+    CatalogueChoice,
+    CataloguePublication,
+    Coverage,
     EntryKind,
     EntryMeta,
     Graph,
@@ -147,6 +150,29 @@ class VaultAPI(Protocol):
     ) -> RoyaltyEvent: ...
 
     def royalties(self, license_id: str | None = None) -> list[RoyaltyEvent]: ...
+
+    # ------------------------------------------------------- public catalogue
+    def export_catalogue(self, items: Sequence[CatalogueChoice], out_dir: Path) -> CataloguePublication:
+        """Write a public catalogue of the chosen entries under out_dir and return the
+        private record of what was published.
+
+        Each entry must have a stored preview with approved True whose commitment is one
+        of its recorded versions (that exact version is listed); otherwise VaultError and
+        nothing is written. The catalogue holds no content: the approved summary and
+        keywords, word count, media type, the version's ledger record and, when an anchor
+        that is not invalid covers it, the chain digests up to that anchor and its token;
+        title, path and tags only when chosen. Signed by the vault identity when the vault
+        has one. Format: docs/FORMAT.md section 15.
+        """
+        ...
+
+    def catalogues(self) -> list[CataloguePublication]:
+        """What was published, oldest first."""
+        ...
+
+    def coverage(self) -> Coverage:
+        """How many ledger records no proven anchor covers yet, and since when."""
+        ...
 
     # ---------------------------------------------------- encrypted side storage
     def aux_get(self, key: str) -> bytes | None:

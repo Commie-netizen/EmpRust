@@ -12,6 +12,7 @@ import { renderActivity } from "./views/activity.js";
 import { renderSearch, focusSearch, resetSearch } from "./views/search.js";
 import { renderLedger } from "./views/ledger.js";
 import { renderLicenses, resetLicenses } from "./views/licenses.js";
+import { renderWatch, resetWatch, onCaptured } from "./watch.js";
 
 const VIEWS = ["graph", "reading", "activity", "search", "ledger", "licenses"];
 const RAIL_ICONS = { graph: "graph", reading: "reading", activity: "activity", search: "search", ledger: "ledger", licenses: "licenses" };
@@ -132,6 +133,16 @@ on("changed", async () => {
   catch (err) { if (!ended(err)) toast(err.message, true); }
 });
 
+// A capture by the watcher: refresh the tree, the graph (keeping a timeline position the
+// user chose) and the activity view if it is open.
+onCaptured(async () => {
+  try {
+    await loadEntries();
+    await loadGraph(untilIso === null);
+    if (current === "activity") renderActivity($("#view-activity"));
+  } catch (err) { if (!ended(err)) toast(err.message, true); }
+});
+
 // ------------------------------------------------------------------ data
 async function loadEntries() {
   const entries = await get("/api/entries");
@@ -194,14 +205,18 @@ async function enterApp() {
   } catch (err) {
     if (!ended(err)) toast(err.message, true);
   }
+  renderWatch(status.watch, status.features.watch);
   clearInterval(poller);
-  poller = setInterval(checkStatus, 15000);
+  // Status polls do not count as activity for the idle lock; faster while capture is on.
+  poller = setInterval(checkStatus, status.features.watch ? 5000 : 15000);
 }
 
 async function checkStatus() {
   try {
     const s = await get("/api/status");
-    if (!s.unlocked && !$("#app").hidden) wipe("Archive verrouillée après une période d'inactivité.");
+    if ($("#app").hidden) return;
+    if (!s.unlocked) { wipe("Archive verrouillée après une période d'inactivité."); return; }
+    renderWatch(s.watch, s.features.watch);
   } catch (err) {
     if (err.code === "bad_token" && !$("#app").hidden) wipe(RESTARTED);
   }
@@ -220,6 +235,7 @@ async function wipe(message, lockServer = false) {
   clearState();
   resetSearch();
   resetLicenses();
+  resetWatch();
   graph.clear();
   renderLegend([]);
   graph.settings = { ...DEFAULT_SETTINGS, groups: [] };

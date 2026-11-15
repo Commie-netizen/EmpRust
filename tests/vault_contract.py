@@ -9,6 +9,7 @@ test_contract_inmemory.py does it for InMemoryVault; the encrypted vault's tests
 do the same with a real vault, so both stay interchangeable.
 """
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -99,6 +100,50 @@ def test_licensing_and_royalties(vault, tmp_path):
         vault.grant("nobody", [], usage="x")
     with pytest.raises(NotFound):
         vault.record_royalty("missing", 1.0)
+
+
+def _approve(vault, entry_id, summary, approved=True):
+    from empreinte.model import Preview
+    latest = vault.versions(entry_id)[-1]
+    preview = Preview(entry_id=entry_id, version=latest.version, summary=summary, keywords=["a", "b", "c"],
+                      words=3, commitment=latest.commitment, model="contrat",
+                      created_at=datetime(2026, 1, 1, tzinfo=timezone.utc), approved=approved)
+    vault.aux_put("preview/" + entry_id, preview.model_dump_json().encode("utf-8"))
+
+
+def test_catalogue_lists_approved_previews_only_and_leaks_nothing(vault, tmp_path):
+    from empreinte.model import CatalogueChoice
+    listed = vault.put("public/listed.md", b"listed text", title="Listed title", tags=["shown-tag"])
+    hidden = vault.put("prive/hidden.md", b"hidden text", title="Hidden title", tags=["hidden-tag"])
+    draft = vault.put("draft.md", b"draft text")
+    _approve(vault, listed.entry_id, "Listed summary. Approved.")
+    _approve(vault, hidden.entry_id, "Hidden summary. Approved but not chosen.")
+    _approve(vault, draft.entry_id, "Draft summary. Not approved.", approved=False)
+    assert vault.catalogues() == []
+    with pytest.raises(VaultError):
+        vault.export_catalogue([CatalogueChoice(entry_id=draft.entry_id)], tmp_path / "refused")
+    assert not (tmp_path / "refused").exists()
+    publication = vault.export_catalogue([CatalogueChoice(entry_id=listed.entry_id, show_tags=True)], tmp_path)
+    [published] = publication.entries
+    assert (published.entry_id, published.version, published.commitment) == (
+        listed.entry_id, 1, listed.commitment)
+    assert published.shown == ["tags"] and published.public_id != listed.entry_id
+    data = b"".join(p.read_bytes() for p in Path(publication.path).rglob("*") if p.is_file()
+                    and p.name != "verify_bundle.py")
+    assert b"Listed summary" in data and b"shown-tag" in data
+    for secret in (b"listed text", b"Listed title", b"public/listed", b"Hidden", b"hidden", b"prive/",
+                   hidden.entry_id.encode(), b"Draft summary"):
+        assert secret not in data, secret
+    assert [p.catalogue_id for p in vault.catalogues()] == [publication.catalogue_id]
+
+
+def test_coverage_counts_records_no_proven_anchor_covers(vault):
+    assert vault.coverage().n_records == 0 and vault.coverage().uncovered == 0
+    first = vault.put("a.md", b"a")
+    vault.put("b.md", b"b")
+    coverage = vault.coverage()
+    assert (coverage.n_records, coverage.uncovered, coverage.covered_upto) == (2, 2, -1)
+    assert coverage.oldest_uncovered_at == first.timestamp
 
 
 def test_aux_store_and_lock(vault):

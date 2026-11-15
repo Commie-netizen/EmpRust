@@ -15,7 +15,10 @@ What is secret and what is not:
 * Plaintext, titles, paths, tags and every model below except LedgerRecord and Anchor
   exist only encrypted on disk and in memory while the vault is unlocked.
 * LedgerRecord and Anchor are designed to be shown to anyone: they hold opaque ids,
-  hashes, sizes and times, never content or names.
+  hashes, sizes and times, never content or names. Coverage holds only counts and times.
+* A public catalogue (catalogue.py, docs/FORMAT.md section 15) is written from approved
+  previews and ledger records only; CatalogueCandidate and CataloguePublication are the
+  owner's private view of it and stay encrypted like everything else.
 """
 from __future__ import annotations
 
@@ -264,6 +267,64 @@ class RoyaltyEvent(_Model):
     period: str = ""  # e.g. "2026-Q4"
     note: str = ""
     seq: int  # ledger record of kind "royalty"
+
+
+class Coverage(_Model):
+    """How much of the ledger a third party can date: records 0..covered_upto are covered
+    by an anchor whose authority was authenticated just now ("proven")."""
+
+    n_records: int
+    covered_upto: int = -1  # last seq covered by a proven anchor; -1 when none is
+    uncovered: int = 0  # records after covered_upto: their date rests on the local clock only
+    oldest_uncovered_at: datetime | None = None  # ledger time of record covered_upto + 1
+    claimed_upto: int = -1  # last seq covered by an anchor that is only "claimed"
+
+
+# ------------------------------------------------------------------- public catalogue
+
+
+class CatalogueChoice(_Model):
+    """One entry the owner lists in a public catalogue. Only the approved preview, sizes
+    and the proof are published; title, path and tags only when ticked here."""
+
+    entry_id: str
+    show_title: bool = False
+    show_path: bool = False
+    show_tags: bool = False
+
+
+class CatalogueCandidate(_Model):
+    """Whether an entry can be listed (owner's interface only, never published)."""
+
+    entry_id: str
+    eligible: bool
+    reason: str = ""  # why not, in French, when not eligible
+    version: int = 0  # the version its approved preview describes
+    latest: bool = True  # that version is the entry's latest
+    summary: str = ""
+    keywords: list[str] = Field(default_factory=list)
+    words: int = 0
+    anchored: Literal["proven", "claimed", "none"] = "none"  # best anchor covering that version now
+
+
+class PublishedEntry(_Model):
+    public_id: str  # 32 hex, random, stable for one (entry, version) across catalogues
+    entry_id: str
+    version: int
+    commitment: str
+    shown: list[Literal["title", "path", "tags"]] = Field(default_factory=list)
+    anchor_state: Literal["proven", "claimed", "none"] = "none"  # as assessed at export time
+    anchored_at: datetime | None = None  # time asserted by that anchor
+
+
+class CataloguePublication(_Model):
+    """The owner's private record of one exported catalogue (kept encrypted)."""
+
+    catalogue_id: str  # 32 hex, random
+    exported_at: datetime
+    path: str  # directory written
+    catalogue_hash: str  # hex SHA-256 of catalogue.json as written
+    entries: list[PublishedEntry] = Field(default_factory=list)
 
 
 class Preview(_Model):

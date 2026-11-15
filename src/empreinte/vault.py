@@ -35,6 +35,7 @@ from .crypto import KdfParams
 from .ledger import (
     ZERO_HASH,
     Ledger,
+    chain_digests,
     check_chain,
     compute_record_hash,
     format_time,
@@ -44,6 +45,9 @@ from .ledger import (
 from .model import (
     Anchor,
     AnchorStatus,
+    CatalogueChoice,
+    CataloguePublication,
+    Coverage,
     EntryKind,
     EntryMeta,
     LedgerRecord,
@@ -192,6 +196,7 @@ class Vault:
         self.notices: list[str] = []  # repairs done at open (not integrity failures)
         self._writer = WriterLock(self.path / WRITER_LOCK)
         held_elsewhere = self._writer.acquire()
+        self.held_by_another_writer = bool(held_elsewhere)  # read-only because another writer has the lock
         if held_elsewhere:
             self._readonly = held_elsewhere
             self.notices.append(held_elsewhere)
@@ -1230,6 +1235,51 @@ class Vault:
         state.bundle_hash = manifest_hash
         self._save_catalog()
         return bundle
+
+    # ================================================================ catalogue and coverage
+
+    def _assessed_anchors(self) -> list:
+        """Anchors that are not invalid, re-checked once per (anchor count, trust roots)."""
+        from .catalogue import AssessedAnchor
+        # Records are append-only, so an anchor's state can change only with the trust roots.
+        key = (len(self._anchors), id(self.trust_roots))
+        cached = getattr(self, "_assessed_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        out = []
+        for anchor in self._anchors:
+            status = self._anchor_status(anchor, self._ledger.records)
+            if status.state != "invalid" and status.anchored_at is not None:
+                out.append(AssessedAnchor(anchor, status.state, status.anchored_at))
+        self._assessed_cache = (key, out)
+        return out
+
+    @_locked
+    def coverage(self) -> Coverage:
+        from .catalogue import coverage_of
+        return coverage_of(self._ledger.records, self._assessed_anchors())
+
+    @_locked
+    def export_catalogue(self, items: Sequence[CatalogueChoice], out_dir: Path) -> CataloguePublication:
+        """Write a public catalogue (see catalogue.py) signed by the vault identity."""
+        from . import catalogue
+        self._require_writable()  # it records what was published (aux values)
+        if self._batch_depth:
+            raise VaultError("cannot export inside a batch")
+        records = self._ledger.records
+        signer = self._signer
+
+        def digests(first: int, last: int) -> list[str]:
+            return chain_digests(records[:last + 1], self._public_hex, first)
+
+        return catalogue.export(self, items, Path(out_dir), public_key=self._public_hex, records=records,
+                                anchors=self._assessed_anchors(), sign=lambda m: signer.sign(m).hex(),
+                                digests=digests)
+
+    @_locked
+    def catalogues(self) -> list[CataloguePublication]:
+        from .catalogue import publications
+        return publications(self)
 
 
 # ==================================================================== helpers

@@ -1,10 +1,10 @@
 # Empreinte vault format, version 1
 
 This document specifies the on-disk format of an Empreinte vault, its ledger, its
-external anchors and its disclosure bundles, precisely enough to write a reader or a
-verifier in another language. The reference implementation is `src/empreinte/crypto.py`,
-`store.py`, `ledger.py`, `vault.py`, `anchor.py`, `licensing.py` and the standalone
-`tools/verify_bundle.py`.
+external anchors, its disclosure bundles and its public catalogues, precisely enough to
+write a reader or a verifier in another language. The reference implementation is
+`src/empreinte/crypto.py`, `store.py`, `ledger.py`, `vault.py`, `anchor.py`,
+`licensing.py`, `catalogue.py` and the standalone `tools/verify_bundle.py`.
 
 ## 1. Conventions
 
@@ -183,7 +183,8 @@ and the rollback information (`n_records`, `head_hash`).
 
 `name = hex(HMAC-SHA256(aux-name subkey, UTF-8 key))`, file `aux/<name[0:2]>/<name>`,
 a blob of type 3 with LABEL `aux:<name>`. Aux values are derived data (index caches,
-previews) and are not in the ledger.
+previews, watched folders and their capture state, catalogue public ids and the record of
+published catalogues) and are not in the ledger.
 
 ## 8. Ledger (ledger.jsonl)
 
@@ -519,6 +520,123 @@ timestamp authority.
 ## 14. Versioning
 
 `header.format_version`, the blob format byte, the ledger body `format` field, the
-catalog `format_version` and the bundle `format_version` are all 1. A reader must refuse
-a version it does not know rather than guess. A future version will add a new value and
-keep reading version 1.
+catalog `format_version`, the bundle `format_version` and the public catalogue
+`format_version` (section 15) are all 1. A reader must refuse a version it does not know
+rather than guess. A future version will add a new value and keep reading version 1.
+
+## 15. Public catalogue
+
+A catalogue is what the owner hands to a prospective licensee before any license: a
+signed list of entries with their approved previews and date proofs, without any
+content. It is not to be confused with `catalog.bin` (section 6), the vault's private
+index. `export_catalogue()` writes `catalogue-<catalogue_id>/`:
+
+```
+catalogue.json     UTF-8 JSON, below; on its own it is the whole catalogue
+anchors/anchor-<seq_upto>.tst   DER tokens of the anchors it uses, for openssl
+README.txt         what it proves and how to check it
+verify_bundle.py   copy of the verifier, when available
+```
+
+```
+catalogue = {
+  "format": "empreinte-catalogue", "format_version": 1,
+  "catalogue_id": hex16 (random),
+  "public_key": hex32 (vault identity),
+  "exported_at": ledger time (the author's clock),
+  "statement": text (what a catalogue proves and does not prove),
+  "entries": [ENTRY, ...]   sorted by public_id,
+  "anchors": [ANCHOR, ...],
+  "signature": hex64 = Ed25519("empreinte/v1/catalogue" || 0x00 || C)
+}
+C = canonical JSON (section 1, ensure_ascii false, UTF-8) of the catalogue object without
+    its "signature" key
+ENTRY = {
+  "public_id": hex16,
+  "media_type": text, "words": int (word count from the preview),
+  "summary": text, "keywords": [text],          the approved preview, as approved
+  "commitment": hex32,                          of the exact version listed
+  "record": the put ledger record of that version, as a ledger line object (section 8),
+  "proof": null | {"anchor": index into "anchors",
+                   "body_digests": [hex32 body_digest of records seq+1 .. anchor.seq_upto]},
+  "title": text, "path": text, "tags": [text]   each present only when the owner chose it
+}
+ANCHOR = the Anchor object (section 10) plus "file"
+```
+
+Only an entry whose stored preview has `approved` true, and whose preview commitment is
+one of the entry's recorded versions, can be listed; that version is the one listed
+(an approved preview of an older version lists the older version). A draft is refused
+and nothing is written. Each entry's anchor is the earliest proven anchor covering its
+record, else the earliest claimed one; an invalid anchor is never used. Without one,
+`proof` is null.
+
+Canonical JSON for the signature: object keys sorted by code point, separators `,` and
+`:`, non-ASCII characters written as UTF-8 (not escaped), strings escaped as Python's
+`json.dumps` does (`\"`, `\\`, `\n`, `\r`, `\t`, `\b`, `\f`, other control characters as
+`\u00XX` with lowercase hex). Only integers, strings, lists, objects and null occur.
+
+**public_id.** 16 random bytes drawn the first time an (entry, version) is published, kept
+encrypted (aux `catalogue/ids.v1`) and reused by every later catalogue, so a licensee can
+name an entry across catalogues. It is a stable handle, not a mask: the disclosed ledger
+record carries the vault's entry id, because the record's canonical body includes it and
+the date proof needs that body. Choosing an unlinkable id per catalogue would therefore
+hide nothing. Hiding the entry id would need a different ledger body (for example a
+commitment to the entry id), that is a new ledger format; it was not done.
+
+Verification algorithm (`verify_bundle.py --catalogue PATH`, PATH a catalogue directory
+or its `catalogue.json`):
+
+1. The exact set of top-level keys, entry keys (the optional three aside) and anchor keys.
+   Limits: 64 MiB, 100000 entries, 100000 anchors.
+2. `signature` verifies with `public_key` over `"empreinte/v1/catalogue" || 0x00 || C`.
+   Any change to any field, the order of entries included, breaks it.
+3. Each anchor: the token checks of section 10 against its own `head_hash`, and
+   `anchored_at` equal to genTime; its state is invalid, claimed or proven.
+4. Each entry: the record's canonical body is recomputed with `public_key`;
+   `record_hash == SHA-256(prev_hash || SHA-256(body))`, the record signature verifies,
+   `kind` is `put` and `record.commitment == commitment`. Public ids and commitments are
+   unique. With a proof: `h = record_hash`, then `h = SHA-256(h || d)` for each digest;
+   `h` must equal the anchor's `head_hash` and `anchor.seq_upto == record.seq + number of
+   digests`. The entry is then proven from the anchor's genTime (proven anchor), claimed
+   by an unauthenticated authority (claimed), or failed (invalid). Without a proof it is
+   reported as not yet provable to a third party: its only date is the author's clock.
+5. With a bundle too (`verify_bundle.py BUNDLE --catalogue PATH`): both are verified,
+   both must carry the same public key, and each verified bundle item is matched to the
+   verified catalogue entry with the same commitment and the same record (seq and
+   record hash). That is what makes the catalogue a promise that can be checked: the
+   licensed document is the one the catalogue dated.
+
+What a catalogue proves: that the vault key signed this list, and that each listed
+document, identified by its commitment, was recorded in that vault's ledger and, with a
+proven anchor, existed no later than the authority's time. It proves nothing about the
+quality or originality of a document, nor who wrote it beyond control of the key. The
+summary is the owner's own statement: re-signing a changed summary with the vault key
+produces a valid catalogue.
+
+**What a catalogue reveals (threat note).** The catalogue is public. Per listed entry:
+the approved summary and keywords (written by a local model, scrubbed, then read and
+approved by the owner: the only text, and the owner's responsibility), the media type,
+the word count, and through the record the exact plaintext size, the version number (so
+how many earlier versions exist), the ledger time and seq of that version, the entry id
+and the cipher hash. Through the seq and the digests: how many records precede the
+listed one and how many lie between it and its anchor, so a rough rate of writing. Through
+the anchors: the ledger length and the authority's time at each anchor used. Anyone who
+also holds the vault's `ledger.jsonl` (a thief of the directory, a sync provider) can use
+the entry id to find every version of a listed entry, their sizes and times, and whether
+it was removed. About an entry that is not listed, nothing but 32-byte digests appears:
+a body digest when its record lies between a listed record and its anchor, or its
+record hash as the `prev_hash` of a listed record; not its kind, size, time, id, title,
+path, tags or text. Two catalogues share the public id of an entry listed in both. The
+title, path and tags of a listed entry appear only when the owner ticks them. The owner's
+private record of each publication (aux `catalogue/published.v1`) stays encrypted.
+
+## 16. Watched folders
+
+`empreinte watch` and the server's continuous capture remember the watched folders and,
+per folder, the size and modification time of every file last captured, in aux values
+(`watch/folders.v1`, `watch/state.v1/<sha256 of path and prefix>`), encrypted like every
+aux value. A capture is an ordinary `put()` (section 9): a watched folder adds nothing to
+the public files beyond the ledger records of the versions it captures. Only the writer
+captures (section 9, "One writer"): a second process that finds the writer lock held
+refuses to start watching instead of opening read-only.

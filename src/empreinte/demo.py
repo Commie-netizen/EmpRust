@@ -357,6 +357,12 @@ class DemoVault(InMemoryVault):
                              error="" if i in self._trusted else "autorité non authentifiée (jeton de démonstration)")
                 for i, a in items]
 
+    def _catalogue_anchors(self) -> list:
+        """Demo anchors with their demo states, for coverage and the demo catalogue."""
+        from .catalogue import AssessedAnchor
+        return [AssessedAnchor(a, "proven" if i in self._trusted else "claimed", a.anchored_at)
+                for i, a in enumerate(self._anchors) if a.anchored_at is not None]
+
     def verify(self) -> VerifyReport:
         report = super().verify()
         report.anchors_checked = len(self._anchors)

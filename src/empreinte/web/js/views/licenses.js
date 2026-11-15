@@ -1,11 +1,17 @@
 // Licences: grants, creating one, exporting the bundle, the royalty register, previews.
-import { h, clear, fmtDate, fmtDateTime, fmtMoney, short, toast } from "../dom.js";
+import { h, clear, fmtDate, fmtDateTime, fmtMoney, short, toast, confirmDialog } from "../dom.js";
 import { get, post, ended } from "../api.js";
 import { state, emit, titleOf } from "../state.js";
 import { requestPreview } from "../reader.js";
 
 const MODEL = { none: "sans redevance", flat: "forfait", per_use: "par utilisation", revenue_share: "partage de revenus" };
 const picked = new Map(); // entry_id -> version (null = latest)
+const listed = new Map(); // catalogue: entry_id -> {show_title, show_path, show_tags}
+const ANCHORED = {
+  proven: ["badge-ok", "date prouvée"],
+  claimed: ["badge-warn", "date seulement déclarée"],
+  none: ["", "pas encore prouvable par un tiers"],
+};
 
 function royaltyText(r) {
   if (r.model === "none") return "Sans redevance";
@@ -16,7 +22,7 @@ function royaltyText(r) {
 
 function field(id, label, input) { input.id = id; return h("div", { class: "field" }, h("label", { for: id, text: label }), input); }
 
-export function resetLicenses() { picked.clear(); }
+export function resetLicenses() { picked.clear(); listed.clear(); }
 
 export async function renderLicenses(root) {
   clear(root);
@@ -26,8 +32,11 @@ export async function renderLicenses(root) {
     h("p", { class: "lead", text: "Céder un droit d'usage note par note, avec la preuve de date de chaque version attachée. Chaque licence et chaque paiement reçu sont inscrits au registre." }));
   const listSlot = h("div");
   const royaltySlot = h("div");
+  const catalogueSlot = h("div");
   inner.append(h("h2", { text: "Licences accordées" }), listSlot, h("h2", { text: "Registre des redevances" }), royaltySlot,
-    h("h2", { text: "Nouvelle licence" }), grantForm(() => renderLicenses(root)));
+    h("h2", { text: "Nouvelle licence" }), grantForm(() => renderLicenses(root)),
+    h("h2", { text: "Catalogue public" }), catalogueSlot);
+  renderCatalogue(catalogueSlot);
 
   let grants, events;
   try { [grants, events] = await Promise.all([get("/api/licenses"), get("/api/royalties")]); }
@@ -63,6 +72,126 @@ export async function renderLicenses(root) {
         }))),
       h("div", { class: "card" }, h("strong", { text: "Total par devise" }),
         h("ul", { class: "link-list" }, ...[...perCurrency.entries()].map(([cur, v]) => h("li", { text: fmtMoney(v, cur) }))))));
+}
+
+// ------------------------------------------------------------------ public catalogue
+// What a prospective licensee may see before any licence: approved previews and date
+// proofs, no text. Only entries with an approved preview can be ticked.
+async function renderCatalogue(slot) {
+  clear(slot).append(
+    h("p", { class: "muted", text: "À remettre à un licencié potentiel avant toute licence. Pour chaque note choisie : son aperçu approuvé, son nombre de mots, son type de fichier, et la preuve qu'une version précise existait au plus tard à une date, vérifiable sans l'archive. Aucun texte de note n'y figure ; titre, chemin et étiquettes seulement si vous les cochez." }),
+    h("p", { class: "faint", style: { fontSize: "12.5px" }, text: "Un catalogue prouve l'existence et la date d'une version. Il ne prouve ni sa qualité, ni son originalité, ni qui l'a écrite au-delà du détenteur de la clé de cette archive." }),
+    h("p", { class: "muted", text: "Chargement..." }));
+  let data;
+  try { data = await get("/api/catalogue"); }
+  catch (err) { if (!ended(err)) clear(slot).appendChild(h("p", { class: "error", text: err.message })); return; }
+  slot.lastChild.remove();
+  const candidates = data.candidates;
+  const byId = new Map(candidates.map((c) => [c.entry_id, c]));
+  for (const id of [...listed.keys()]) if (!byId.has(id) || !byId.get(id).eligible) listed.delete(id);
+
+  const filter = h("input", { type: "search", placeholder: "Filtrer les notes", "aria-label": "Filtrer les notes du catalogue" });
+  const onlyEligible = h("input", { type: "checkbox", id: "cat-eligible", checked: true });
+  const list = h("div", { class: "picker", role: "group", "aria-label": "Notes du catalogue", style: { maxHeight: "360px" } });
+  const count = h("span", { class: "muted" });
+  const err = h("p", { class: "error", role: "alert" });
+  const result = h("div");
+  const nEligible = candidates.filter((c) => c.eligible).length;
+
+  const renderCount = () => {
+    count.textContent = `${listed.size} note${listed.size > 1 ? "s" : ""} choisie${listed.size > 1 ? "s" : ""} sur ${nEligible} avec un aperçu approuvé`;
+  };
+  const showBox = (id, key, label) => {
+    const opts = listed.get(id);
+    const box = h("input", { type: "checkbox", checked: !!(opts && opts[key]), disabled: !opts,
+      on: { change: () => { const o = listed.get(id); if (o) o[key] = box.checked; } } });
+    return h("label", {}, box, label);
+  };
+  const renderList = () => {
+    clear(list);
+    const q = filter.value.trim().toLowerCase();
+    let shown = 0;
+    for (const e of state.entries) {
+      const c = byId.get(e.entry_id);
+      if (!c || (onlyEligible.checked && !c.eligible)) continue;
+      if (q && !e.title.toLowerCase().includes(q) && !e.path.toLowerCase().includes(q)) continue;
+      if (++shown > 400) break;
+      const box = h("input", { type: "checkbox", checked: listed.has(e.entry_id), disabled: !c.eligible,
+        "aria-label": `Inclure ${e.title} dans le catalogue`,
+        on: { change: () => {
+          if (box.checked) listed.set(e.entry_id, { show_title: false, show_path: false, show_tags: false });
+          else listed.delete(e.entry_id);
+          renderList(); renderCount();
+        } } });
+      const [cls, label] = ANCHORED[c.anchored] || ANCHORED.none;
+      const why = c.eligible
+        ? h("div", { class: "catalogue-why" },
+          h("div", { class: "faint", text: c.summary }),
+          !c.latest ? h("div", { class: "faint", text: `L'aperçu approuvé décrit la version ${c.version}, pas la dernière : c'est elle qui serait listée.` }) : null,
+          h("div", { class: "catalogue-show" }, h("span", { text: "Montrer aussi :" }),
+            showBox(e.entry_id, "show_title", "le titre"), showBox(e.entry_id, "show_path", "le chemin"), showBox(e.entry_id, "show_tags", "les étiquettes")))
+        : h("div", { class: "catalogue-why faint", text: `Non sélectionnable : ${c.reason}` });
+      list.appendChild(h("div", { class: "catalogue-row" }, box,
+        h("span", { text: e.title }),
+        c.eligible ? h("span", { class: `badge ${cls}`, text: label }) : h("span"),
+        why));
+    }
+    if (!shown) list.appendChild(h("p", { class: "faint", text: nEligible ? "Aucune note ne correspond." : "Aucune note n'a encore d'aperçu approuvé : générez un aperçu depuis une note, relisez-le, puis approuvez-le." }));
+  };
+  filter.addEventListener("input", renderList);
+  onlyEligible.addEventListener("change", renderList);
+  renderList(); renderCount();
+
+  const exportBtn = h("button", { class: "btn btn-primary", text: "Exporter le catalogue", on: { click: async () => {
+    err.textContent = "";
+    if (!listed.size) { err.textContent = "Choisissez au moins une note avec un aperçu approuvé."; return; }
+    const items = [...listed.entries()].map(([entry_id, o]) => ({ entry_id, ...o }));
+    const shownFields = (key) => items.filter((i) => i[key]).length;
+    const ok = await confirmDialog("Exporter un catalogue public ?", h("div", {},
+      h("p", { text: `${items.length} note${items.length > 1 ? "s" : ""}. Ce fichier est fait pour être donné : tout ce qu'il contient doit pouvoir être lu par n'importe qui.` }),
+      h("ul", {},
+        h("li", { text: "aperçus approuvés, nombre de mots, type de fichier, taille exacte et date du registre de chaque version" }),
+        h("li", { text: `titres : ${shownFields("show_title")}, chemins : ${shownFields("show_path")}, étiquettes : ${shownFields("show_tags")}` }),
+        h("li", { text: "le nombre d'enregistrements du registre entre chaque version et son ancre, pas leur contenu" })),
+      h("p", { class: "faint", text: "Aucun texte de note n'est écrit. L'identifiant de chaque version dans le registre y figure, car la preuve de date en a besoin." })),
+      { ok: "Exporter" });
+    if (!ok) return;
+    exportBtn.disabled = true;
+    try {
+      const pub = await post("/api/catalogue", { items, confirm: true });
+      clear(result).appendChild(h("p", { class: "muted", style: { fontSize: "13px" } },
+        "Catalogue écrit dans ", h("span", { class: "mono", text: pub.path }), `, empreinte ${short(pub.catalogue_hash, 16)}.`));
+      toast("Catalogue exporté.");
+      data.publications.push(pub);
+      renderPublications(pubSlot, data.publications);
+    } catch (ex) { if (!ended(ex)) err.textContent = ex.message; }
+    exportBtn.disabled = false;
+  } } });
+
+  const pubSlot = h("div");
+  slot.append(
+    h("div", { class: "card" },
+      h("div", { class: "row" }, filter,
+        h("label", { for: "cat-eligible", class: "muted", style: { display: "inline-flex", gap: "4px", alignItems: "center" } }, onlyEligible, "seulement les notes sélectionnables")),
+      list, count, err,
+      state.features.export ? h("div", { class: "row", style: { marginTop: "10px" } }, exportBtn)
+        : h("p", { class: "faint", text: "L'export n'est pas configuré pour cette archive." }),
+      result),
+    h("h3", { text: "Catalogues publiés" }), pubSlot);
+  renderPublications(pubSlot, data.publications);
+}
+
+function renderPublications(slot, pubs) {
+  clear(slot);
+  if (!pubs.length) { slot.appendChild(h("p", { class: "faint", text: "Aucun catalogue exporté pour l'instant." })); return; }
+  slot.appendChild(h("div", { class: "table-wrap" }, h("table", { class: "data-table" },
+    h("thead", {}, h("tr", {}, ...["Exporté le", "Notes", "Datées par une ancre prouvée", "Dossier", "Empreinte"].map((t) => h("th", { text: t })))),
+    h("tbody", {}, ...pubs.slice().reverse().map((p) => h("tr", {},
+      h("td", { text: fmtDateTime(p.exported_at) }),
+      h("td", { title: p.entries.map((e) => titleOf(e.entry_id)).join(", "), text: String(p.entries.length) }),
+      h("td", { text: String(p.entries.filter((e) => e.anchor_state === "proven").length) }),
+      h("td", { class: "mono", text: p.path }),
+      h("td", { class: "mono", title: p.catalogue_hash, text: short(p.catalogue_hash, 10) })))))));
 }
 
 function grantCard(g, refresh) {

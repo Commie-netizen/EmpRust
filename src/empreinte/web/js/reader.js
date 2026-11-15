@@ -65,7 +65,11 @@ export function provenanceCard(proof, version) {
       h("div", { class: "faint", text: `Un jeton d'horodatage${claimed ? ` de ${claimed.authority}` : ""} couvre cette version, mais cette autorité n'a pas pu être authentifiée : c'est sa déclaration, pas une preuve.` }));
   } else {
     row("Horodatage extérieur", h("span", { class: "muted", text: "aucun ne couvre encore cette version" }),
-      h("div", { class: "faint", text: "Sa date ne repose pour l'instant que sur le registre local." }));
+      h("div", { class: "faint", text: "Sa date ne repose pour l'instant que sur le registre local : aucun tiers ne peut encore la vérifier. Un ancrage depuis le Registre la couvrirait, avec tout ce qui a été enregistré avant elle." }));
+  }
+  if (!proof.proven_before && proof.claimed_before) {
+    row("Couverture", h("span", { class: "badge badge-warn", text: "non couverte par une ancre authentifiée" }),
+      h("div", { class: "faint", text: "Aucun tiers ne peut encore vérifier la date de cette version. Un ancrage depuis le Registre la couvrirait, avec tout ce qui a été enregistré avant elle." }));
   }
   if (statuses && statuses.length) row("Ancres", anchorStatusList(statuses));
   if (proof.anchor_errors && proof.anchor_errors.length) {

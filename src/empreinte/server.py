@@ -49,7 +49,8 @@ changing, needs a same-origin Origin). Errors are `{"error": code, "message": te
     GET    /                                  the interface (index.html with the page token)
     GET    /<file>                            static files of web/ (css, js, svg)
     GET    /api/status                    X   {exists, unlocked, demo, features{import, previews,
-                                              export, anchor_methods}, idle_timeout, retry_after}
+                                              export, watch, anchor_methods}, idle_timeout, retry_after,
+                                              watch, coverage}; watch and coverage only with U
     POST   /api/unlock                    XS  {passphrase} -> {unlock_token, idle_timeout}
     POST   /api/create                    XS  {passphrase} -> {unlock_token, idle_timeout, recovery_key}
     POST   /api/lock                      XS  {} -> {locked: true}; needs U when a session is open
@@ -71,6 +72,9 @@ changing, needs a same-origin Origin). Errors are `{"error": code, "message": te
     POST   /api/licenses                  XUS {licensee, items:[{entry_id, version|null}], usage, terms?,
                                               royalty?:{model, amount, currency, note}, valid_until?} -> LicenseGrant
     POST   /api/licenses/<id>/export      XUS {} -> {license_id, path, bundle_hash}   (only when an export dir is set)
+    GET    /api/catalogue                 XU  {candidates: [CatalogueCandidate], publications: [CataloguePublication]}
+    POST   /api/catalogue                 XUS {items:[{entry_id, show_title, show_path, show_tags}], confirm: true}
+                                              -> CataloguePublication   (only when an export dir is set)
     GET    /api/royalties                 XU  ?license_id= -> [RoyaltyEvent]
     POST   /api/royalties                 XUS {license_id, amount, currency?, received_on?, period?, note?} -> RoyaltyEvent
     POST   /api/previews                  XUS {entry_ids:[...]} -> [Preview + {current, digest}] drafts
@@ -79,6 +83,9 @@ changing, needs a same-origin Origin). Errors are `{"error": code, "message": te
     POST   /api/previews/<id>/approve     XUS {digest} -> Preview + {current, digest}, approved true
                                               (409 changed when digest differs, 409 stale)
     POST   /api/import                    XUS {path} -> dict                   (only when import_folder is set)
+    GET    /api/watch                     XU  {folders, captures, last_capture, pending, quiet, last_error}
+    POST   /api/watch                     XUS {action: add|remove, path, prefix?} -> same (only when
+                                              make_watcher is set; /api/status also carries it)
     GET    /api/prefs                     XU  interface preferences, stored encrypted with aux_put
     PUT    /api/prefs                     XUS any JSON object up to 64 KiB -> {saved: true}
 
@@ -115,7 +122,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from pydantic import BaseModel, ValidationError
 
 from .api import Corrupted, NotFound, VaultAPI, VaultError, WorkspaceAPI, WrongPassphrase
-from .model import Preview, RoyaltyTerms
+from .model import CatalogueChoice, Preview, RoyaltyTerms
 
 WEB_DIR = Path(__file__).with_name("web")
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
@@ -173,6 +180,11 @@ class Session:
     make_previews: Callable[[VaultAPI, WorkspaceAPI, list[str]], list[Preview]] | None = None
     export_dir: Path | None = None
     demo: bool = False
+    # Continuous capture: a factory of watch.Watcher (None hides the feature). The watcher
+    # of a session starts when it is installed and stops on every lock path.
+    make_watcher: Callable[[], Any] | None = None
+    # Folders a watched folder may neither contain nor be inside (the vault, its exports).
+    watch_forbidden: tuple[Path, ...] = ()
 
 
 @dataclass
@@ -210,6 +222,7 @@ class Active:
     workspace: WorkspaceAPI
     token: str
     generation: int
+    watcher: Any = None  # watch.WatchThread of this session, if continuous capture is on
 
 
 # ---------------------------------------------------------------------- rate limiting
@@ -377,6 +390,8 @@ def close_session(active: Active | None, *, lock_vault: bool = True) -> None:
     (Vault.close() frees its writer lock, when the vault has one). Never raises."""
     if active is None:
         return
+    if active.watcher is not None:
+        active.watcher.stop()  # never blocks; it also re-checks the session before any capture
     close = getattr(active.workspace, "close", None)
     if close is not None:
         try:
@@ -447,7 +462,29 @@ class App:
                 # The previous workspace always goes; its vault too, unless the new
                 # session reopened that same vault object.
                 close_session(previous, lock_vault=previous.vault is not vault)
+            self._start_watcher(self.active)
             return self.active.token
+
+    def _start_watcher(self, active: Active) -> None:
+        """Start continuous capture for this session (caller holds self.lock). Every
+        capture runs under self.lock after checking that `active` is still the session."""
+        factory = self.session.make_watcher
+        if factory is None or getattr(active.vault, "held_by_another_writer", False):
+            return
+        from .watch import Stale, WatchThread
+
+        def run_locked(fn: Callable[[VaultAPI], Any]) -> Any:
+            with self.lock:
+                if self.stopped or self.active is not active:
+                    raise Stale()
+                return fn(active.vault)
+
+        def on_capture(vault: VaultAPI, captures: list) -> None:
+            active.workspace.refresh()
+
+        thread = WatchThread(factory(), run_locked, on_capture)
+        active.watcher = thread
+        thread.start()
 
     def do_lock(self) -> bool:
         """Lock the open session, if any, and invalidate every pending unlock or
@@ -496,6 +533,7 @@ class App:
             "import": self.session.import_folder is not None,
             "previews": self.session.make_previews is not None,
             "export": self.session.export_dir is not None,
+            "watch": self.session.make_watcher is not None,
             "anchor_methods": anchor_methods_of(active.vault) if active is not None else [],
         }
 
@@ -532,12 +570,16 @@ ROUTES: list[Route] = [
     _r("GET", r"/api/licenses", "licenses"),
     _r("POST", r"/api/licenses", "grant"),
     _r("POST", r"/api/licenses/([^/]+)/export", "export"),
+    _r("GET", r"/api/catalogue", "catalogue_get"),
+    _r("POST", r"/api/catalogue", "catalogue_export"),
     _r("GET", r"/api/royalties", "royalties"),
     _r("POST", r"/api/royalties", "record_royalty"),
     _r("POST", r"/api/previews", "previews"),
     _r("GET", r"/api/previews/([^/]+)", "preview_get"),
     _r("POST", r"/api/previews/([^/]+)/approve", "preview_approve"),
     _r("POST", r"/api/import", "import_folder"),
+    _r("GET", r"/api/watch", "watch_get"),
+    _r("POST", r"/api/watch", "watch_change"),
     _r("GET", r"/api/prefs", "prefs_get"),
     _r("PUT", r"/api/prefs", "prefs_put"),
 ]
@@ -938,6 +980,14 @@ class Handler(BaseHTTPRequestHandler):
                 app.do_lock()
             active = app.current(given)
             features = app.features(active)
+            # Only for the holder of the unlock token: folder paths are private.
+            watch = active.watcher.watcher.summary() if active is not None and active.watcher is not None else None
+            coverage = None
+            if active is not None and callable(getattr(active.vault, "coverage", None)):
+                try:
+                    coverage = active.vault.coverage()  # anchor states are cached by the vault
+                except VaultError:
+                    coverage = None
         try:
             exists = bool(app.session.exists())
         except Exception:  # noqa: BLE001
@@ -949,6 +999,8 @@ class Handler(BaseHTTPRequestHandler):
             "features": features,
             "idle_timeout": app.options.idle_timeout,
             "retry_after": round(app.limiter.wait(), 2),
+            "watch": watch,
+            "coverage": to_json(coverage) if coverage is not None else None,
         }
 
     def _installed(self, vault: VaultAPI, workspace: WorkspaceAPI, seen: int) -> str:
@@ -1150,6 +1202,31 @@ class Handler(BaseHTTPRequestHandler):
         grant = next((g for g in self._vault().licenses() if g.license_id == license_id), None)
         return {"license_id": license_id, "path": str(path), "bundle_hash": grant.bundle_hash if grant else ""}
 
+    def api_catalogue_get(self, *, params: dict, body: dict) -> dict:
+        from .catalogue import candidates
+        vault = self._vault()
+        return {"candidates": candidates(vault), "publications": vault.catalogues()}
+
+    def api_catalogue_export(self, *, params: dict, body: dict) -> Any:
+        out_dir = self.app.session.export_dir
+        if out_dir is None:
+            raise ApiError(404, "feature_off", "export non configuré")
+        if not req_bool(body, "confirm"):
+            raise bad("confirmation requise : le catalogue est destiné à être rendu public")
+        raw_items = body.get("items")
+        if not isinstance(raw_items, list) or not (1 <= len(raw_items) <= 10000):
+            raise bad("items doit être une liste de 1 à 10000 éléments")
+        choices = []
+        for raw in raw_items:
+            if not isinstance(raw, dict) or set(raw) - {"entry_id", "show_title", "show_path", "show_tags"}:
+                raise bad("chaque item est {entry_id, show_title, show_path, show_tags}")
+            entry_id = raw.get("entry_id")
+            if not isinstance(entry_id, str) or not ENTRY_ID.fullmatch(entry_id):
+                raise bad("entry_id invalide")
+            choices.append(CatalogueChoice(entry_id=entry_id, show_title=req_bool(raw, "show_title"),
+                                           show_path=req_bool(raw, "show_path"), show_tags=req_bool(raw, "show_tags")))
+        return self._vault().export_catalogue(choices, Path(out_dir))
+
     def api_royalties(self, *, params: dict, body: dict) -> list:
         raw = params.get("license_id")
         license_id = license_id_of(raw) if raw else None
@@ -1253,6 +1330,37 @@ class Handler(BaseHTTPRequestHandler):
         result = run(self._vault(), self._ws(), path)
         self._ws().refresh()
         return result if isinstance(result, dict) else {"result": result}
+
+    def _watch_thread(self) -> Any:
+        assert self._active is not None
+        if self.app.session.make_watcher is None or self._active.watcher is None:
+            raise ApiError(404, "feature_off", "suivi des dossiers non disponible")
+        return self._active.watcher
+
+    def api_watch_get(self, *, params: dict, body: dict) -> dict:
+        return self._watch_thread().watcher.summary()
+
+    def api_watch_change(self, *, params: dict, body: dict) -> dict:
+        """{action: "add", path, prefix?} or {action: "remove", path}. Nothing already in
+        the archive is ever removed by this route."""
+        from .watch import add_folder, remove_folder
+
+        thread = self._watch_thread()
+        action = body.get("action")
+        if action not in ("add", "remove"):
+            raise bad("action doit valoir add ou remove")
+        path = req_str(body, "path", min_len=1, max_len=1000).strip()
+        vault = self._vault()
+        try:
+            if action == "add":
+                prefix = req_str(body, "prefix", required=False, max_len=200).strip()
+                folders = add_folder(vault, path, prefix, forbidden=self.app.session.watch_forbidden)
+            else:
+                folders = remove_folder(vault, path)
+        except ValueError as exc:
+            raise bad(str(exc)) from None
+        thread.watcher.set_folders(vault, folders)
+        return thread.watcher.summary()
 
     def api_prefs_get(self, *, params: dict, body: dict) -> dict:
         raw = self._vault().aux_get(PREFS_KEY)

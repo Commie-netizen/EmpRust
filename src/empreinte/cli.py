@@ -2,6 +2,7 @@
 
     empreinte init VAULT                 create an encrypted vault (prints the recovery key once)
     empreinte import VAULT FOLDER        record every file of a folder (an Obsidian vault for example)
+    empreinte watch VAULT [FOLDER...]    remember the folders, then capture each change until Ctrl+C
     empreinte serve VAULT                open the interface in the browser (unlock there)
     empreinte verify VAULT               re-check the whole ledger and every blob
     empreinte anchor VAULT               ask an outside authority to timestamp the chain head
@@ -66,14 +67,24 @@ def report_dict(report) -> dict:
     return data
 
 
-def _open(path: Path):
+BUSY = ("Cette archive est déjà ouverte en écriture par un autre processus (empreinte watch, serve ou "
+        "import) : fermez-le d'abord. Un seul processus écrit dans une archive.")
+
+
+def _open(path: Path, *, writer: bool = False):
+    """Open the vault. `writer`: refuse, with a clear message, a vault another process
+    is writing (it would open read-only and every write would fail)."""
     from .vault import Vault
 
     _require_vault(path)
     try:
-        return Vault.open(path, _passphrase("Phrase de passe : "))
+        vault = Vault.open(path, _passphrase("Phrase de passe : "))
     except WrongPassphrase:
         raise SystemExit("Phrase de passe incorrecte.") from None
+    if writer and vault.held_by_another_writer:
+        vault.close()
+        raise SystemExit(BUSY)
+    return vault
 
 
 def _print(obj) -> None:
@@ -100,12 +111,60 @@ def cmd_import(args: argparse.Namespace) -> int:
 
     if not Path(args.folder).is_dir():
         raise SystemExit(f"Dossier introuvable : {args.folder}")
-    vault = _open(args.vault)
+    vault = _open(args.vault, writer=True)
     try:
         report = sync_folder(vault, args.folder, prefix=args.prefix)
     finally:
         vault.lock()
     _print(report_dict(report))
+    return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Remember the folders given, then capture every remembered folder until Ctrl+C."""
+    import time
+
+    from .watch import Watcher, add_folder, load_folders
+
+    for folder in args.folders:
+        if not Path(folder).is_dir():
+            raise SystemExit(f"Dossier introuvable : {folder}")
+    if args.prefix and len(args.folders) != 1:
+        raise SystemExit("--prefix ne s'utilise qu'avec un seul dossier.")
+    vault = _open(args.vault, writer=True)
+    vault_path = Path(args.vault).resolve()
+    forbidden = (vault_path, vault_path.parent / f"{vault_path.name}-licences")
+    try:
+        known = {f.path for f in load_folders(vault)}
+        for folder in args.folders:
+            resolved = str(Path(folder).resolve())
+            if resolved in known:
+                continue
+            try:
+                add_folder(vault, resolved, args.prefix, forbidden=forbidden)
+            except ValueError as exc:
+                raise SystemExit(f"{folder} : {exc}") from None
+        watcher = Watcher(quiet=args.quiet, interval=args.interval)
+        watcher.load(vault)
+        if not watcher.folders:
+            raise SystemExit("Aucun dossier suivi : donnez au moins un dossier.")
+        for folder in watcher.folders:
+            print(f"Suivi : {folder.path}" + (f"  (rangé sous {folder.prefix}/)" if folder.prefix else ""))
+        print(f"Capture d'un fichier après {args.quiet:g} s sans modification. Ctrl+C pour arrêter.", flush=True)
+        try:
+            while True:
+                for capture in watcher.poll(vault):
+                    stamp = capture.at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                    what = "nouveau" if capture.version == 1 else f"version {capture.version}"
+                    print(f"{stamp}  {what}  {capture.path}", flush=True)
+                if watcher.last_error:
+                    print(f"Attention : {watcher.last_error}", file=sys.stderr, flush=True)
+                    watcher.last_error = ""
+                time.sleep(watcher.interval)
+        except KeyboardInterrupt:
+            print("Arrêt du suivi.")
+    finally:
+        vault.lock()
     return 0
 
 
@@ -153,10 +212,16 @@ def session_for(path: Path, *, model: str | None = None, model_url: str = "http:
     from .vault import Vault
     from .workspace import Workspace
 
+    from .watch import Watcher
+
     path = Path(path)
+    export_dir = path.parent / f"{path.name}-licences"
 
     def open_vault(passphrase: str):
         vault = Vault.open(path, passphrase)
+        if vault.held_by_another_writer:
+            vault.close()
+            raise VaultError(BUSY)
         return vault, Workspace(vault)
 
     def create_vault(passphrase: str):
@@ -187,7 +252,9 @@ def session_for(path: Path, *, model: str | None = None, model_url: str = "http:
         import_folder=import_folder,
         make_previews=make_previews,
         # License bundles hold plaintext by design: they go next to the vault, never inside it.
-        export_dir=path.parent / f"{path.name}-licences",
+        export_dir=export_dir,
+        make_watcher=Watcher,
+        watch_forbidden=(path, export_dir),
     )
 
 
@@ -237,6 +304,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("folder", type=Path)
     p.add_argument("--prefix", default="", help="logical folder to file the import under")
     p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("watch")
+    p.add_argument("vault", type=Path)
+    p.add_argument("folders", type=Path, nargs="*", help="folders to add to the remembered ones")
+    p.add_argument("--prefix", default="", help="logical folder (only with one folder)")
+    p.add_argument("--quiet", type=float, default=60.0, help="seconds without change before a capture")
+    p.add_argument("--interval", type=float, default=3.0, help="seconds between two scans")
+    p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("verify")
     p.add_argument("vault", type=Path)
