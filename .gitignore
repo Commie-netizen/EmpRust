@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+*.egg-info/
+.venv/
+# Vaults, trial data and license bundles never go into version control.
+data/
+.codex-tmp*/
+rust/target/

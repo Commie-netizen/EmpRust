@@ -1,0 +1,40 @@
+[package]
+name = "empreinte"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+anyhow = "1"
+aes-gcm = "0.10"
+argon2 = "0.5"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+data-encoding = "2"
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+include_dir = "0.7"
+rand = "0.8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+unicode-normalization = "0.1"
+walkdir = "2"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+strip = true

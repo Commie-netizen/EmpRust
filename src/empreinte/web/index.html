@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="empreinte-token" content="__EMPREINTE_PAGE_TOKEN__">
+<title>Empreinte</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="js/app.js"></script>
+</head>
+<body>
+<noscript><p class="noscript">Empreinte a besoin de JavaScript, servi uniquement par ce serveur local.</p></noscript>
+
+<div id="auth" class="auth" hidden>
+  <div class="auth-card">
+    <div class="auth-brand">
+      <svg class="auth-logo" viewBox="0 0 32 32" aria-hidden="true"><circle cx="9" cy="10" r="3"/><circle cx="23" cy="8" r="2.4"/><circle cx="16" cy="22" r="4"/><circle cx="26" cy="22" r="2"/><path d="M9 10 16 22 23 8M16 22h10"/></svg>
+      <h1>Empreinte</h1>
+    </div>
+    <p class="auth-sub">Archive personnelle chiffrée sur cette machine, datée par un registre signé et chaîné, vérifiable.</p>
+    <div id="auth-body"></div>
+  </div>
+</div>
+
+<div id="app" class="app" hidden>
+  <nav class="rail" aria-label="Vues">
+    <button class="rail-btn" data-view="graph" aria-label="Graphe" title="Graphe"></button>
+    <button class="rail-btn" data-view="reading" aria-label="Lecture" title="Lecture"></button>
+    <button class="rail-btn" data-view="activity" aria-label="Activité" title="Activité"></button>
+    <button class="rail-btn" data-view="search" aria-label="Recherche (Ctrl+K)" title="Recherche (Ctrl+K)"></button>
+    <button class="rail-btn" data-view="ledger" aria-label="Registre" title="Registre"></button>
+    <button class="rail-btn" data-view="licenses" aria-label="Licences" title="Licences"></button>
+    <span class="rail-spacer"></span>
+    <button class="rail-btn" id="toggle-sidebar" aria-label="Afficher ou masquer les fichiers" title="Fichiers" aria-expanded="true"></button>
+    <button class="rail-btn rail-lock" id="lock-btn" aria-label="Verrouiller" title="Verrouiller"></button>
+  </nav>
+
+  <aside class="sidebar" id="sidebar" aria-label="Fichiers de l'archive">
+    <div class="sidebar-head">
+      <span class="sidebar-title" id="vault-name">Archive</span>
+      <button class="icon-btn" id="collapse-all" aria-label="Replier tous les dossiers" title="Replier tout"></button>
+    </div>
+    <div class="sidebar-filter">
+      <label class="sr-only" for="tree-filter">Filtrer les fichiers</label>
+      <input id="tree-filter" type="search" placeholder="Filtrer les fichiers" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="tree" id="tree" role="tree" aria-label="Arborescence"></div>
+    <div class="sidebar-foot">
+      <span id="vault-count" class="muted"></span>
+      <button class="link-btn" id="import-btn" hidden>Importer un dossier</button>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <section class="view view-graph" id="view-graph" aria-label="Graphe">
+      <div class="graph-wrap">
+        <canvas id="graph-canvas" tabindex="0" aria-label="Graphe des notes. Glisser pour déplacer, molette pour zoomer, flèches pour se déplacer, plus et moins pour zoomer."></canvas>
+        <div class="graph-status" id="graph-status" aria-live="polite"></div>
+        <div class="graph-legend" id="graph-legend" hidden aria-label="Légende des couleurs du graphe"></div>
+        <div class="graph-panel" id="graph-panel"></div>
+        <aside class="reader-pane" id="reader-pane" hidden aria-label="Note ouverte"></aside>
+      </div>
+      <div class="timeline" id="timeline"></div>
+    </section>
+    <section class="view view-scroll" id="view-reading" hidden aria-label="Lecture"></section>
+    <section class="view view-scroll" id="view-activity" hidden aria-label="Activité"></section>
+    <section class="view view-scroll" id="view-search" hidden aria-label="Recherche"></section>
+    <section class="view view-scroll" id="view-ledger" hidden aria-label="Registre"></section>
+    <section class="view view-scroll" id="view-licenses" hidden aria-label="Licences"></section>
+  </main>
+</div>
+
+<dialog id="dialog" class="dialog" aria-labelledby="dialog-title">
+  <div class="dialog-form">
+    <h2 id="dialog-title"></h2>
+    <div id="dialog-body"></div>
+    <div class="dialog-actions">
+      <button type="button" class="btn" id="dialog-cancel">Annuler</button>
+      <button type="button" class="btn btn-primary" id="dialog-ok">Confirmer</button>
+    </div>
+  </div>
+</dialog>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
