@@ -9,18 +9,21 @@ anyhow = "1"
 aes-gcm = "0.10"
 argon2 = "0.5"
 axum = "0.8"
-base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 data-encoding = "2"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 hex = "0.4"
+fs2 = "0.4"
+libc = "0.2"
 hkdf = "0.12"
 hmac = "0.12"
 include_dir = "0.7"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 rand = "0.8"
+percent-encoding = "2"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

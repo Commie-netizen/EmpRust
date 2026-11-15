@@ -1,8 +1,34 @@
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
 .pytest_cache/
 *.egg-info/
+dist/
+build/
 .venv/
-# Vaults, trial data and license bundles never go into version control.
-data/
-.codex-tmp*/
+env/
+venv/
+
+# Rust
+target/
 rust/target/
+**/*.rs.bk
+
+# Sensitive archive data, vaults and trial bundles
+data/
+*.vault
+*.vault/
+coffre/
+*.tst
+*.bundle
+.empreinte-essai/
+.codex-tmp*/
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
