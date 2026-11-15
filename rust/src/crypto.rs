@@ -163,6 +163,30 @@ pub fn unpack(data: &[u8]) -> Result<(Value, Zeroizing<Vec<u8>>)> {
         Zeroizing::new(data[4 + n..].to_vec()),
     ))
 }
+/// Retourne les 32 octets bruts du SHA-256 de `data`.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Signe `msg` avec `sk` (Ed25519) ; retourne les 64 octets de signature.
+pub fn sign_bytes(sk: &ed25519_dalek::SigningKey, msg: &[u8]) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    sk.sign(msg).to_bytes()
+}
+
+/// Vérifie une signature Ed25519. `pub_bytes` : 32 octets, `sig_bytes` : 64 octets.
+pub fn verify_signature(pub_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> Result<()> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let key_arr: [u8; 32] = pub_bytes.try_into().map_err(|_| anyhow!("clé publique : 32 octets attendus"))?;
+    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| anyhow!("signature : 64 octets attendus"))?;
+    let vk = VerifyingKey::from_bytes(&key_arr).map_err(|e| anyhow!("clé publique invalide : {e}"))?;
+    let sig = Signature::from_bytes(&sig_arr);
+    vk.verify(msg, &sig).map_err(|_| anyhow!("signature invalide"))
+}
+
 pub fn recovery_text(raw: &[u8]) -> String {
     let sum = Sha256::digest(raw);
     let text = data_encoding::BASE32_NOPAD.encode(&[raw, &sum[..2]].concat());
