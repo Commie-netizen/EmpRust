@@ -510,7 +510,7 @@ impl Vault {
         Ok(())
     }
     pub fn verify(&self) -> Value {
-        let result = (|| -> Result<usize> {
+        let result = (|| -> Result<(usize, usize)> {
             self.check_structure()?;
             self.writable()?;
             let key = c::subkey(&self.master, &self.id, "metadata");
@@ -569,21 +569,96 @@ impl Vault {
                     count += 1;
                 }
             }
-            ensure!(
-                self.anchors.is_empty(),
-                "validation RFC 3161 non encore portée : utiliser le vérificateur Python"
-            );
-            Ok(count)
+            let mut anchors_checked = 0;
+            for a in &self.anchors {
+                let seq = a["seq_upto"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("seq_upto manquant"))?
+                    as usize;
+                ensure!(seq < self.records.len(), "seq_upto dépasse le registre");
+                let rec = &self.records[seq];
+                let expected_head = s(rec, "record_hash");
+                ensure!(
+                    s(a, "head_hash") == expected_head,
+                    "head_hash de l'ancre ne correspond pas au record_hash"
+                );
+                let proof_b64 = s(a, "proof");
+                let head_bytes = hex::decode(expected_head)?;
+                let eval = crate::anchor::evaluate_token(&proof_b64, &head_bytes)?;
+                ensure!(
+                    eval["status"] != "invalid",
+                    "ancre invalide: {}",
+                    eval["error"].as_str().unwrap_or("erreur de jeton")
+                );
+                anchors_checked += 1;
+            }
+            Ok((count, anchors_checked))
         })();
-        json!({"ok":result.is_ok(),"n_records":self.records.len(),"head_hash":self.head(),"signatures_checked":self.records.len(),"blobs_checked":result.as_ref().copied().unwrap_or(0),"anchors_checked":0,"errors":result.err().map(|e|vec![e.to_string()]).unwrap_or_default()})
+        let (blobs_checked, anchors_checked) = result.as_ref().copied().unwrap_or((0, 0));
+        json!({
+            "ok": result.is_ok(),
+            "n_records": self.records.len(),
+            "head_hash": self.head(),
+            "signatures_checked": self.records.len(),
+            "blobs_checked": blobs_checked,
+            "anchors_checked": anchors_checked,
+            "errors": result.err().map(|e| vec![e.to_string()]).unwrap_or_default()
+        })
     }
     pub fn proof(&self, id: &str, number: Option<usize>) -> Result<Value> {
         let v = self.version(id, number)?;
         let seq = v["seq"].as_u64().unwrap() as usize;
         check_chain(&self.records, &s(&self.header, "public_key"))?;
-        Ok(
-            json!({"record":self.records[seq],"public_key":self.header["public_key"],"head_hash":self.head(),"n_following":self.records.len()-seq-1,"anchors":[],"anchor_assessments":[],"proven_before":null,"claimed_before":null,"anchor_errors":if self.anchors.is_empty(){vec![]}else{vec!["Ancres existantes non validées par cette version Rust."]},"verified":true}),
-        )
+
+        let mut matching_anchors = Vec::new();
+        let mut anchor_assessments = Vec::new();
+        let mut proven_before: Option<String> = None;
+        let mut claimed_before: Option<String> = None;
+        let mut anchor_errors = Vec::new();
+
+        for a in &self.anchors {
+            let a_seq = a["seq_upto"].as_u64().unwrap_or(0) as usize;
+            if a_seq >= seq {
+                matching_anchors.push(a.clone());
+                let proof_b64 = s(a, "proof");
+                if let Ok(head_bytes) = hex::decode(s(a, "head_hash")) {
+                    if let Ok(eval) = crate::anchor::evaluate_token(&proof_b64, &head_bytes) {
+                        let st = eval["status"].as_str().unwrap_or("invalid");
+                        anchor_assessments.push(json!({
+                            "seq_upto": a_seq,
+                            "status": st,
+                            "anchored_at": a["anchored_at"]
+                        }));
+                        if st == "proven" {
+                            let t = s(a, "anchored_at").to_string();
+                            if proven_before.is_none() || proven_before.as_deref() > Some(&t) {
+                                proven_before = Some(t);
+                            }
+                        } else if st == "claimed" {
+                            let t = s(a, "anchored_at").to_string();
+                            if claimed_before.is_none() || claimed_before.as_deref() > Some(&t) {
+                                claimed_before = Some(t);
+                            }
+                        } else if let Some(err) = eval["error"].as_str() {
+                            anchor_errors.push(err.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(json!({
+            "record": self.records[seq],
+            "public_key": self.header["public_key"],
+            "head_hash": self.head(),
+            "n_following": self.records.len() - seq - 1,
+            "anchors": matching_anchors,
+            "anchor_assessments": anchor_assessments,
+            "proven_before": proven_before,
+            "claimed_before": claimed_before,
+            "anchor_errors": anchor_errors,
+            "verified": true
+        }))
     }
     fn aux_path(&self, key: &str) -> (PathBuf, String) {
         let name_key = c::subkey(&self.master, &self.id, "aux-name");
