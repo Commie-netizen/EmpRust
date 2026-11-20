@@ -1,0 +1,20 @@
+{
+  "id": "date-proven-only-when-authenticated",
+  "origin": [
+    "docs/reviews/2026-11-14-continuation.md : deux tests attendaient encore une autorité non authentifiée comme preuve",
+    "revue du 15 novembre : rust/src/anchor.rs (travail non commité) déclarait proven sans vérifier la signature ; le moteur Rust reste hors de la portée tant qu'aucun test Rust ne réfute cette règle"
+  ],
+  "refuted_by": [
+    "python-tests"
+  ],
+  "scope": [
+    "src/empreinte/anchor.py",
+    "src/empreinte/vault.py",
+    "src/empreinte/catalogue.py",
+    "tools/verify_bundle.py",
+    "src/empreinte/web/js/reader.js"
+  ],
+  "state": "evaluated",
+  "statement": "Une date n'est présentée comme prouvée que si la signature du jeton d'horodatage et la chaîne de certificats de l'autorité ont été vérifiées jusqu'à une racine de confiance ; sinon elle est seulement déclarée (claimed), jamais prouvée.",
+  "version": 1
+}

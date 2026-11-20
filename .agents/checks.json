@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "checks": {
+    "cargo-test": {
+      "description": "Tests Rust du crate, hors ligne (--offline --locked) : aucun téléchargement. Les tests utilisent des dossiers temporaires et des données synthétiques.",
+      "command": {
+        "unix": ["cargo", "test", "--offline", "--locked", "--manifest-path", "rust/Cargo.toml", "--all-targets"],
+        "windows": ["cargo", "test", "--offline", "--locked", "--manifest-path", "rust/Cargo.toml", "--all-targets"]
+      },
+      "cwd": ".",
+      "timeout_secs": 1800,
+      "max_output_bytes": 65536
+    },
+    "python-tests": {
+      "description": "Suite Python (pytest, avec les tests Node). tests/conftest.py interdit tout accès réseau ; les coffres de test sont créés dans des dossiers temporaires, jamais dans le coffre personnel ou le coffre d'essai. Sous WSL, lance le Python Windows de l'environnement par l'interopérabilité.",
+      "command": {
+        "unix": ["/mnt/c/Users/sawle/.venvs/empreinte/Scripts/python.exe", "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+        "windows": ["C:/Users/sawle/.venvs/empreinte/Scripts/python.exe", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+      },
+      "cwd": ".",
+      "timeout_secs": 900,
+      "max_output_bytes": 65536
+    }
+  }
+}

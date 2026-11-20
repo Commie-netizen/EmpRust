@@ -20,7 +20,19 @@ avec un dossier de travail persistant hors OneDrive.
 CLI disponible : `init`, `serve`, `import`, `list`, `verify`, `demo`.
 Les commandes de coffre demandent la phrase de passe sans l'inscrire dans les arguments.
 La création fournit une clé de secours au format v1 ; sa récupération se fait encore
-avec la version Python. Les chemins d'import dans WSL sont de forme `/mnt/c/...`.
+avec `recover-access` en Rust. Les chemins d'import dans WSL sont de forme `/mnt/c/...`.
+
+Gestion des accès (phrases et clés demandées sans les inscrire dans les arguments) :
+
+```sh
+empreinte change-passphrase /chemin/coffre
+empreinte recover-access /chemin/coffre
+empreinte rotate-recovery-key /chemin/coffre
+```
+
+Ces opérations réenveloppent la clé maître ; contenu, identité et registre restent
+inchangés. La récupération d'accès ne répare pas un registre endommagé. La rotation
+invalide l'ancienne clé pour le coffre actuel, pas pour ses anciennes sauvegardes.
 
 ## Fonctions portées
 
@@ -31,17 +43,21 @@ avec la version Python. Les chemins d'import dans WSL sont de forme `/mnt/c/...`
 - Serveur en boucle locale, jetons de page/session, contrôles Host/Origin,
   expiration après 15 minutes, limite de corps et connexions bornées.
 - Arborescence, lecture, liens de base, graphe, recherche textuelle, calendrier,
-  registre et import manuel. Lecture des licences/redevances existantes.
+  registre et import manuel. Création et lecture des licences/redevances.
+- Export sélectif signé des versions licenciées, dans un dossier voisin
+  `<nom-du-coffre>-licences`. Chaque export utilise un nouveau sous-dossier.
+  Les documents exportés sont en clair ; les autres versions restent dans le coffre.
 - Budget UTF-8 de contexte disponible en bibliothèque.
 
 ## Écarts restant à porter
 
-- Validation et émission RFC 3161 : capacités désactivées ; aucune date externe
-  n'est présentée comme prouvée. `verify` signale qu'il ne peut conclure pour
-  une archive comportant des ancres. Aucun service extérieur n'est appelé.
-- Création/export de licences, redevances, catalogue public et surveillance continue.
+- RFC 3161 : le parseur contrôle la structure et l'empreinte, mais ne valide pas
+  la signature TSA ni sa chaîne de confiance. Statut maximal `claimed`, jamais
+  `proven`. Les exports avec ancres sont refusés ; utiliser Python pour ceux-ci.
+  Aucun service extérieur n'est appelé.
+- Catalogue public et surveillance : modules présents, intégration API restante.
 - Appels au modèle, aperçus, approbation et politique de cache.
-- Récupération après incident, rotation de phrase de passe/clé de secours.
+- Réparation après incident du registre/catalogue (distincte de la récupération d'accès).
 - Parité du parseur (frontmatter/alias), classement BM25, mentions historiques,
   statistiques détaillées et résolution Unicode des liens.
 - Compilation et tests natifs Windows : cette validation cible Linux/WSL.
@@ -69,4 +85,6 @@ python tools/test_rust_interop.py --driver /chemin/absolu/target/debug/examples/
 Sous Windows, le script exécute le pilote dans Ubuntu WSL. Il crée exclusivement des
 coffres jetables : Python → Rust → Python et Rust → Python, documents Unicode,
 versions, engagements, signatures, licences/redevances existantes et données auxiliaires.
+Il vérifie aussi une licence et une redevance créées en Rust, puis un export Rust
+avec le vérificateur Python indépendant du moteur Rust.
 Le pilote de test utilise des identifiants publics et un KDF allégé ; il n'est pas une CLI utilisateur.

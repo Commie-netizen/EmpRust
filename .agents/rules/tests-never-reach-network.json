@@ -1,0 +1,18 @@
+{
+  "id": "tests-never-reach-network",
+  "origin": [
+    "15 novembre 2026 : un test d'ancrage a rouvert un coffre sans le faux transport et a envoyé une vraie requête à DigiCert ; garde ajoutée dans tests/conftest.py"
+  ],
+  "refuted_by": [
+    "python-tests",
+    "cargo-test"
+  ],
+  "scope": [
+    "tests/",
+    "tools/verify_bundle.py",
+    "rust/src/"
+  ],
+  "state": "evaluated",
+  "statement": "Aucun test ne contacte un service extérieur : tests/conftest.py fait échouer tout appel à urllib pendant la suite Python, les autorités d'horodatage des tests sont factices, et les tests Rust tournent hors ligne (--offline).",
+  "version": 1
+}

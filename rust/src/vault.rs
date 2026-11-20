@@ -78,6 +78,7 @@ pub struct Vault {
     signer: SigningKey,
     writer: File,
     poisoned: bool,
+    via_recovery: bool,
 }
 impl Drop for Vault {
     fn drop(&mut self) {
@@ -120,6 +121,12 @@ impl Vault {
         Ok((Self::open(path, pass)?, recovery_text))
     }
     pub fn open(path: &Path, pass: &str) -> Result<Self> {
+        Self::open_using(path, pass, false)
+    }
+    pub fn open_recovery(path: &Path, recovery: &str) -> Result<Self> {
+        Self::open_using(path, recovery, true)
+    }
+    fn open_using(path: &Path, pass: &str, via_recovery: bool) -> Result<Self> {
         ensure!(
             !fs::symlink_metadata(path)?.file_type().is_symlink(),
             "racine liée refusée"
@@ -133,13 +140,23 @@ impl Vault {
         );
         let id = c::bytes(&header["vault_id"])?;
         ensure!(id.len() == 16, "identité invalide");
-        let pk = c::passkey(pass, &header["kdf"])?;
-        let master = c::unwrap(
-            &pk,
-            &header["master_key_wraps"]["passphrase"],
-            &c::aad("passphrase", &id, &c::canonical(&header["kdf"])),
-        )
-        .context("phrase de passe incorrecte ou en-tête altéré")?;
+        let master = if via_recovery {
+            let raw = c::parse_recovery(pass)?;
+            let key = c::hkdf(&raw, &id, b"empreinte/v1/recovery-wrap");
+            c::unwrap(
+                &key,
+                &header["master_key_wraps"]["recovery"],
+                &c::aad("recovery", &id, &[]),
+            )?
+        } else {
+            let pk = c::passkey(pass, &header["kdf"])?;
+            c::unwrap(
+                &pk,
+                &header["master_key_wraps"]["passphrase"],
+                &c::aad("passphrase", &id, &c::canonical(&header["kdf"])),
+            )
+            .context("phrase de passe incorrecte ou en-tête altéré")?
+        };
         ensure!(master.len() == 32, "clé maître invalide");
         let identity = c::subkey(&master, &id, "identity");
         let seed = c::unwrap(
@@ -198,6 +215,7 @@ impl Vault {
             signer,
             writer,
             poisoned: false,
+            via_recovery,
         };
         vault.check_structure()?;
         Ok(vault)
@@ -207,6 +225,55 @@ impl Vault {
             .last()
             .map(|r| s(r, "record_hash"))
             .unwrap_or_else(zeros)
+    }
+    pub fn change_passphrase(&mut self, old: &str, new: &str) -> Result<()> {
+        use subtle::ConstantTimeEq;
+        self.writable()?;
+        let key = c::passkey(old, &self.header["kdf"])?;
+        let master = c::unwrap(
+            &key,
+            &self.header["master_key_wraps"]["passphrase"],
+            &c::aad("passphrase", &self.id, &c::canonical(&self.header["kdf"])),
+        )?;
+        ensure!(
+            bool::from(master.as_slice().ct_eq(self.master.as_slice())),
+            "phrase actuelle incorrecte"
+        );
+        self.replace_passphrase(new)
+    }
+    pub fn reset_passphrase(&mut self, new: &str) -> Result<()> {
+        ensure!(self.via_recovery, "ouverture par clé de secours requise");
+        self.replace_passphrase(new)
+    }
+    fn replace_passphrase(&mut self, new: &str) -> Result<()> {
+        self.writable()?;
+        let mut header = self.header.clone();
+        header["kdf"]["salt"] = json!(hex::encode(c::random(16)));
+        let key = c::passkey(new, &header["kdf"])?;
+        header["master_key_wraps"]["passphrase"] = c::wrap(
+            &key,
+            &self.master,
+            &c::aad("passphrase", &self.id, &c::canonical(&header["kdf"])),
+        )?;
+        self.poisoned = true;
+        atomic(&self.path.join("header.json"), &c::canonical(&header))?;
+        self.header = header;
+        self.poisoned = false;
+        self.via_recovery = false;
+        Ok(())
+    }
+    pub fn rotate_recovery_key(&mut self) -> Result<Zeroizing<String>> {
+        self.writable()?;
+        let raw = Zeroizing::new(c::random(32));
+        let key = c::hkdf(&raw, &self.id, b"empreinte/v1/recovery-wrap");
+        let mut header = self.header.clone();
+        header["master_key_wraps"]["recovery"] =
+            c::wrap(&key, &self.master, &c::aad("recovery", &self.id, &[]))?;
+        self.poisoned = true;
+        atomic(&self.path.join("header.json"), &c::canonical(&header))?;
+        self.header = header;
+        self.poisoned = false;
+        Ok(Zeroizing::new(c::recovery_text(&raw)))
     }
     fn check_structure(&self) -> Result<()> {
         ensure!(
@@ -436,7 +503,7 @@ impl Vault {
             .position(|e| e["path"] == path && e["removed"] != true);
         if let Some(i) = existing {
             let id = s(&self.catalog["entries"][i], "entry_id");
-            if &*self.read(&id, None)? == body {
+            if self.read(&id, None)?.as_slice() == body {
                 return Ok(public_version(&id, self.version(&id, None)?));
             }
         }
@@ -694,6 +761,251 @@ impl Vault {
             &c::seal(&k, 3, value, &self.id, &format!("aux:{name}"))?,
         )
     }
+
+    fn commit_document(&mut self, kind: &str, document: Value) -> Result<Value> {
+        self.writable()?;
+        let seq = self.records.len();
+        let timestamp = now();
+        let body = Zeroizing::new(c::canonical(&document));
+        let salt = c::random(32);
+        let key = c::subkey(&self.master, &self.id, "license");
+        let blob = c::seal(
+            &key,
+            if kind == "license" { 4 } else { 5 },
+            &c::pack(&json!({"salt":hex::encode(&salt)}), &body),
+            &self.id,
+            &format!("{kind}:{seq}"),
+        )?;
+        let cipher_hash = c::hash(&blob);
+        atomic(&self.blob_path(&cipher_hash)?, &blob)?;
+        self.append(json!({"kind":kind,"entry_id":"","version":0,"size":0,"commitment":c::hash(&[salt.as_slice(),body.as_slice()].concat()),"cipher_hash":cipher_hash,"timestamp":timestamp}))?;
+        let state = json!({"seq":seq,"committed":std::str::from_utf8(&body)?,"salt":hex::encode(salt),"cipher_hash":cipher_hash,"bundle_hash":""});
+        self.catalog[if kind == "license" {
+            "licenses"
+        } else {
+            "royalties"
+        }]
+        .as_array_mut()
+        .unwrap()
+        .push(state);
+        self.save_catalog()?;
+        self.poisoned = false;
+        Ok(document)
+    }
+    pub fn licenses(&self) -> Result<Vec<Value>> {
+        self.catalog["licenses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|state| {
+                let mut grant: Value = serde_json::from_str(&s(state, "committed"))?;
+                grant["bundle_hash"] = state["bundle_hash"].clone();
+                Ok(grant)
+            })
+            .collect()
+    }
+    pub fn royalties(&self, license_id: Option<&str>) -> Result<Vec<Value>> {
+        let all = self.catalog["royalties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|state| serde_json::from_str::<Value>(&s(state, "committed")))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(all
+            .into_iter()
+            .filter(|e| license_id.is_none_or(|id| e["license_id"] == id))
+            .collect())
+    }
+    pub fn grant(&mut self, request: &Value) -> Result<Value> {
+        let licensee = bounded_text(request, "licensee", 1, 200)?;
+        let usage = bounded_text(request, "usage", 1, 1000)?;
+        let terms = bounded_text(request, "terms", 0, 20000)?;
+        let raw = request["items"]
+            .as_array()
+            .ok_or_else(|| anyhow!("liste des documents requise"))?;
+        ensure!(
+            !raw.is_empty() && raw.len() <= 1000,
+            "1 à 1000 documents requis"
+        );
+        let mut seen = std::collections::HashSet::new();
+        let mut items = Vec::new();
+        for item in raw {
+            let id = s(item, "entry_id");
+            let number = if item["version"].is_null() {
+                None
+            } else {
+                Some(
+                    item["version"]
+                        .as_u64()
+                        .ok_or_else(|| anyhow!("version invalide"))? as usize,
+                )
+            };
+            let entry = self.entry(&id)?;
+            let version = self.version(&id, number)?;
+            ensure!(
+                seen.insert((id.clone(), version["version"].as_u64().unwrap())),
+                "document dupliqué dans la licence"
+            );
+            items.push(json!({"entry_id":id,"version":version["version"],"title":entry["title"],"commitment":version["commitment"]}));
+        }
+        let r = &request["royalty"];
+        let model = r["model"].as_str().unwrap_or("none");
+        ensure!(
+            ["none", "flat", "per_use", "revenue_share"].contains(&model),
+            "modèle de redevance invalide"
+        );
+        let amount = r["amount"].as_f64().unwrap_or(0.0);
+        ensure!(
+            amount.is_finite()
+                && amount >= 0.0
+                && amount
+                    <= if model == "revenue_share" {
+                        100.0
+                    } else {
+                        1e12
+                    },
+            "montant invalide"
+        );
+        let currency = r["currency"].as_str().unwrap_or("EUR");
+        currency_ok(currency)?;
+        let note = bounded_text(r, "note", 0, 500)?;
+        let until = optional_date(&request["valid_until"])?;
+        let doc = json!({"license_id":hex::encode(c::random(16)),"licensee":licensee,"usage":usage,"terms":terms,"items":items,"royalty":{"model":model,"amount":amount,"currency":currency,"note":note},"created_at":now(),"valid_until":until,"seq":self.records.len(),"bundle_hash":""});
+        self.commit_document("license", doc)
+    }
+    pub fn record_royalty(&mut self, request: &Value) -> Result<Value> {
+        let id = s(request, "license_id");
+        ensure!(
+            self.licenses()?.iter().any(|g| g["license_id"] == id),
+            "licence inconnue"
+        );
+        let amount = request["amount"]
+            .as_f64()
+            .ok_or_else(|| anyhow!("montant numérique requis"))?;
+        ensure!(
+            amount.is_finite() && amount != 0.0 && amount.abs() <= 1e12,
+            "montant invalide"
+        );
+        let currency = request["currency"].as_str().unwrap_or("EUR");
+        currency_ok(currency)?;
+        let day = optional_date(&request["received_on"])?
+            .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+        let doc = json!({"license_id":id,"amount":amount,"currency":currency,"received_on":day,"period":bounded_text(request,"period",0,40)?,"note":bounded_text(request,"note",0,500)?,"seq":self.records.len()});
+        self.commit_document("royalty", doc)
+    }
+    pub fn export_bundle(&mut self, id: &str, out: &Path) -> Result<Value> {
+        self.writable()?;
+        ensure!(hex_id(id, 32), "identifiant de licence invalide");
+        ensure!(
+            self.anchors.is_empty(),
+            "export avec ancres RFC 3161 : utiliser encore la version Python"
+        );
+        let index = self.catalog["licenses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|state| {
+                serde_json::from_str::<Value>(&s(state, "committed"))
+                    .is_ok_and(|g| g["license_id"] == id)
+            })
+            .ok_or_else(|| anyhow!("licence inconnue"))?;
+        let state = self.catalog["licenses"][index].clone();
+        let grant: Value = serde_json::from_str(&s(&state, "committed"))?;
+        fs::create_dir_all(out)?;
+        ensure!(
+            !fs::symlink_metadata(out)?.file_type().is_symlink(),
+            "répertoire de sortie lié refusé"
+        );
+        let root = out.canonicalize()?;
+        ensure!(
+            !root.starts_with(&self.path),
+            "export en clair interdit dans le coffre"
+        );
+        // Unique destination: never erase or overwrite an earlier disclosure.
+        let bundle = root.join(format!("license-{id}-{}", hex::encode(c::random(4))));
+        fs::create_dir(&bundle)?;
+        fs::create_dir(bundle.join("items"))?;
+        let mut first = state["seq"].as_u64().unwrap() as usize;
+        let mut manifest_items = Vec::new();
+        for (i, item) in grant["items"].as_array().unwrap().iter().enumerate() {
+            let entry_id = s(item, "entry_id");
+            let n = item["version"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("version invalide"))? as usize;
+            let entry = self.entry(&entry_id)?;
+            let version = self.version(&entry_id, Some(n))?;
+            let seq = version["seq"].as_u64().unwrap() as usize;
+            first = first.min(seq);
+            ensure!(
+                item["commitment"] == version["commitment"],
+                "engagement de licence incohérent"
+            );
+            let ext = match entry["media_type"].as_str().unwrap_or("") {
+                "text/markdown" => "md",
+                "text/plain" => "txt",
+                "application/json" => "json",
+                "application/pdf" => "pdf",
+                _ => "bin",
+            };
+            let name = format!("items/{:02}_{entry_id}_v{n}.{ext}", i + 1);
+            atomic(&bundle.join(&name), &self.read(&entry_id, Some(n))?)?;
+            manifest_items.push(json!({"file":name,"entry_id":entry_id,"version":n,"title":item["title"],"media_type":entry["media_type"],"salt":version["salt"],"record":self.records[seq]}));
+        }
+        let committed = Zeroizing::new(s(&state, "committed"));
+        atomic(&bundle.join("grant.json"), committed.as_bytes())?;
+        let head = self.records.last().unwrap();
+        let key = s(&self.header, "public_key");
+        let manifest = json!({"format":"empreinte-bundle","format_version":1,"license_id":id,"public_key":key,"exported_at":now(),
+            "grant":{"file":"grant.json","salt":state["salt"],"signature":hex::encode(self.signer.sign(&[b"empreinte/v1/grant\0".as_slice(),committed.as_bytes()].concat()).to_bytes()),"record":self.records[state["seq"].as_u64().unwrap() as usize]},
+            "items":manifest_items,"chain":{"from_seq":first,"prev_hash":self.records[first]["prev_hash"],"body_digests":self.records.iter().skip(first).map(|r|hex::encode(body_digest(r,&key))).collect::<Vec<_>>()},
+            "head":{"seq":head["seq"],"record_hash":head["record_hash"],"signature":head["signature"]},"anchors":[]});
+        let bytes = serde_json::to_vec_pretty(&manifest)?;
+        let bundle_hash = c::hash(&bytes);
+        atomic(&bundle.join("manifest.json"), &bytes)?;
+        atomic(
+            &bundle.join("verify_bundle.py"),
+            include_bytes!("../../tools/verify_bundle.py"),
+        )?;
+        atomic(&bundle.join("README.txt"),b"Empreinte disclosure bundle. Contains ONLY the licensed document versions, in plaintext.\nNo external timestamps. Local ledger dates prove order, not civil time.\nVerify with an independently obtained copy of verify_bundle.py (Python + cryptography).\nCompare the public key with one obtained separately from the author.\n")?;
+        self.catalog["licenses"][index]["bundle_hash"] = json!(bundle_hash);
+        self.poisoned = true;
+        self.save_catalog()?;
+        self.poisoned = false;
+        Ok(json!({"license_id":id,"path":bundle,"bundle_hash":bundle_hash}))
+    }
+}
+fn bounded_text(value: &Value, key: &str, min: usize, max: usize) -> Result<String> {
+    let text = if value[key].is_null() && min == 0 {
+        ""
+    } else {
+        value[key]
+            .as_str()
+            .ok_or_else(|| anyhow!("texte requis : {key}"))?
+    };
+    ensure!(
+        text.trim().chars().count() >= min && text.chars().count() <= max,
+        "longueur invalide : {key}"
+    );
+    Ok(text.to_owned())
+}
+fn currency_ok(value: &str) -> Result<()> {
+    ensure!(
+        value.len() == 3 && value.bytes().all(|c| c.is_ascii_uppercase()),
+        "devise invalide"
+    );
+    Ok(())
+}
+fn optional_date(value: &Value) -> Result<Option<String>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value.as_str().ok_or_else(|| anyhow!("date invalide"))?;
+    let parsed = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")?;
+    ensure!(
+        parsed.format("%Y-%m-%d").to_string() == text,
+        "date non canonique"
+    );
+    Ok(Some(text.to_owned()))
 }
 pub fn hex_id(s: &str, n: usize) -> bool {
     s.len() == n
@@ -773,6 +1085,91 @@ pub fn entry_meta(e: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn access_rotation_preserves_content_and_revokes_old_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let (mut v, recovery) = Vault::create(&path, "old", true).unwrap();
+        let item = v.put("a.md", b"preserved", "text/markdown", None).unwrap();
+        let original_header = v.header.clone();
+        let original_head = v.head();
+        assert!(v.reset_passphrase("unauthorized").is_err());
+        assert!(v.change_passphrase("wrong", "new").is_err());
+        assert!(v.change_passphrase("old", "").is_err());
+        assert_eq!(v.header, original_header);
+        v.change_passphrase("old", "new").unwrap();
+        drop(v);
+        assert!(Vault::open(&path, "old").is_err());
+        let v = Vault::open(&path, "new").unwrap();
+        assert_eq!(v.head(), original_head);
+        drop(v);
+        let mut v = Vault::open_recovery(&path, &recovery).unwrap();
+        v.reset_passphrase("recovered").unwrap();
+        let new_recovery = v.rotate_recovery_key().unwrap();
+        drop(v);
+        assert!(Vault::open_recovery(&path, &recovery).is_err());
+        let v = Vault::open_recovery(&path, &new_recovery.to_ascii_lowercase()).unwrap();
+        assert_eq!(
+            v.read(&s(&item, "entry_id"), None).unwrap().as_slice(),
+            b"preserved"
+        );
+        assert_eq!(v.verify()["ok"], true);
+        drop(v);
+        assert!(Vault::open(&path, "new").is_err());
+        assert!(Vault::open(&path, "recovered").is_ok());
+        assert!(c::parse_recovery("invalid").is_err());
+    }
+    #[test]
+    fn licensing_rejects_duplicates_and_exports_only_selected_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault");
+        let (mut v, _) = Vault::create(&path, "test", true).unwrap();
+        let item = v
+            .put("selected.md", b"licensed version", "text/markdown", None)
+            .unwrap();
+        v.put("selected.md", b"private revision", "text/markdown", None)
+            .unwrap();
+        v.put("private.md", b"unlicensed", "text/markdown", None)
+            .unwrap();
+        let request = json!({"licensee":"Test","usage":"Evaluation","items":[{"entry_id":item["entry_id"],"version":1}]});
+        let mut duplicate = request.clone();
+        duplicate["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(request["items"][0].clone());
+        let count = v.records.len();
+        assert!(v.grant(&duplicate).is_err());
+        assert_eq!(v.records.len(), count);
+        let grant = v.grant(&request).unwrap();
+        assert!(
+            v.record_royalty(&json!({"license_id":grant["license_id"],"amount":0}))
+                .is_err()
+        );
+        assert!(
+            v.record_royalty(&json!({"license_id":"missing","amount":1}))
+                .is_err()
+        );
+        assert!(
+            v.export_bundle(&s(&grant, "license_id"), &path.join("exports"))
+                .is_err()
+        );
+        let output = v
+            .export_bundle(&s(&grant, "license_id"), &tmp.path().join("exports"))
+            .unwrap();
+        let files = fs::read_dir(Path::new(&s(&output, "path")).join("items"))
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read(files[0].path()).unwrap(), b"licensed version");
+        assert_eq!(v.verify()["ok"], true);
+        drop(v);
+        let v = Vault::open(&path, "test").unwrap();
+        assert_eq!(
+            v.licenses().unwrap()[0]["bundle_hash"],
+            output["bundle_hash"]
+        );
+    }
     #[test]
     fn create_reopen_version_lock_and_tamper() {
         let tmp = tempfile::tempdir().unwrap();

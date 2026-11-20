@@ -16,6 +16,16 @@ rust/target/
 **/*.rs.bk
 
 # Sensitive archive data, vaults and trial bundles
+.empreinte-head/
+.empreinte-memory/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.operations.lock
+conversation-exports/
+.env
+.env.*
+!.env.example
 data/
 *.vault
 *.vault/

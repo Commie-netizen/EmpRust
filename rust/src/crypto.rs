@@ -180,11 +180,17 @@ pub fn sign_bytes(sk: &ed25519_dalek::SigningKey, msg: &[u8]) -> [u8; 64] {
 /// Vérifie une signature Ed25519. `pub_bytes` : 32 octets, `sig_bytes` : 64 octets.
 pub fn verify_signature(pub_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> Result<()> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    let key_arr: [u8; 32] = pub_bytes.try_into().map_err(|_| anyhow!("clé publique : 32 octets attendus"))?;
-    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| anyhow!("signature : 64 octets attendus"))?;
-    let vk = VerifyingKey::from_bytes(&key_arr).map_err(|e| anyhow!("clé publique invalide : {e}"))?;
+    let key_arr: [u8; 32] = pub_bytes
+        .try_into()
+        .map_err(|_| anyhow!("clé publique : 32 octets attendus"))?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| anyhow!("signature : 64 octets attendus"))?;
+    let vk =
+        VerifyingKey::from_bytes(&key_arr).map_err(|e| anyhow!("clé publique invalide : {e}"))?;
     let sig = Signature::from_bytes(&sig_arr);
-    vk.verify(msg, &sig).map_err(|_| anyhow!("signature invalide"))
+    vk.verify(msg, &sig)
+        .map_err(|_| anyhow!("signature invalide"))
 }
 
 pub fn recovery_text(raw: &[u8]) -> String {
@@ -195,6 +201,24 @@ pub fn recovery_text(raw: &[u8]) -> String {
         .map(|c| std::str::from_utf8(c).unwrap())
         .collect::<Vec<_>>()
         .join("-")
+}
+pub fn parse_recovery(text: &str) -> Result<Zeroizing<Vec<u8>>> {
+    use subtle::ConstantTimeEq;
+    ensure!(text.len() <= 100, "clé de secours trop longue");
+    let normalized = Zeroizing::new(
+        text.chars()
+            .filter(|c| *c != '-' && !c.is_ascii_whitespace())
+            .collect::<String>()
+            .to_ascii_uppercase(),
+    );
+    let decoded = Zeroizing::new(data_encoding::BASE32_NOPAD.decode(normalized.as_bytes())?);
+    ensure!(decoded.len() == 34, "longueur de clé de secours invalide");
+    let checksum = Sha256::digest(&decoded[..32]);
+    ensure!(
+        bool::from(decoded[32..].ct_eq(&checksum[..2])),
+        "somme de contrôle invalide"
+    );
+    Ok(Zeroizing::new(decoded[..32].to_vec()))
 }
 
 #[cfg(test)]

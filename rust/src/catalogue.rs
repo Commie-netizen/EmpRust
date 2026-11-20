@@ -28,8 +28,7 @@ pub const IDS_KEY: &str = "catalogue/ids.v1";
 pub const PUBLISHED_KEY: &str = "catalogue/published.v1";
 pub const MAX_ENTRIES: usize = 10_000;
 
-pub const STATEMENT: &str =
-    "This catalogue proves only that each listed document, identified by its commitment, \
+pub const STATEMENT: &str = "This catalogue proves only that each listed document, identified by its commitment, \
      was recorded in the ledger of the vault whose public key is given, and, for an entry \
      with an anchor, that it existed no later than the time asserted by that timestamp \
      authority. It shows none of the documents. It proves nothing about their quality or \
@@ -73,7 +72,9 @@ pub struct CataloguePublication {
 /// compacts, UTF-8 non échappé, sans la clé "signature").
 pub fn canonical_catalogue(doc: &Value) -> Result<Vec<u8>> {
     // Reconstruit l'objet sans la clé "signature" dans l'ordre trié des clés.
-    let obj = doc.as_object().ok_or_else(|| anyhow!("catalogue doit être un objet JSON"))?;
+    let obj = doc
+        .as_object()
+        .ok_or_else(|| anyhow!("catalogue doit être un objet JSON"))?;
     let mut sorted: BTreeMap<&str, &Value> = BTreeMap::new();
     for (k, v) in obj.iter() {
         if k != "signature" {
@@ -94,9 +95,7 @@ fn best_anchor(anchors: &[AssessedAnchor], seq: u64) -> Option<(usize, &Assessed
     let covering: Vec<(usize, &AssessedAnchor)> = anchors
         .iter()
         .enumerate()
-        .filter(|(_, a)| {
-            a.anchor["seq_upto"].as_u64().unwrap_or(0) >= seq
-        })
+        .filter(|(_, a)| a.anchor["seq_upto"].as_u64().unwrap_or(0) >= seq)
         .collect();
 
     for wanted in &["proven", "claimed"] {
@@ -119,6 +118,7 @@ fn best_anchor(anchors: &[AssessedAnchor], seq: u64) -> Option<(usize, &Assessed
 // ──────────────────────────────────────────── export principal ───────────────
 
 /// Paramètres pour `export_catalogue`.
+pub type DigestProvider = Box<dyn Fn(usize, usize) -> Result<Vec<String>>>;
 pub struct ExportParams<'a> {
     /// Clé de signature (None → signature vide, pour les tests).
     pub signing_key: Option<&'a SigningKey>,
@@ -130,7 +130,7 @@ pub struct ExportParams<'a> {
     pub anchors: Vec<AssessedAnchor>,
     /// `digests(first, last)` → liste de hex SHA-256 des corps des enregistrements
     /// seq first..=last. Nécessaire uniquement quand une ancre couvre une entrée.
-    pub digests: Option<Box<dyn Fn(usize, usize) -> Result<Vec<String>>>>,
+    pub digests: Option<DigestProvider>,
     /// Répertoire de sortie (le catalogue sera écrit dans un sous-dossier).
     pub out_dir: PathBuf,
 }
@@ -168,15 +168,26 @@ pub fn export_catalogue(
     entries_meta: Vec<EntryMeta>,
     params: ExportParams<'_>,
 ) -> Result<CataloguePublication> {
-    ensure!(!choices.is_empty(), "le catalogue doit contenir au moins une entrée");
-    ensure!(choices.len() <= MAX_ENTRIES, "trop d'entrées dans le catalogue");
+    ensure!(
+        !choices.is_empty(),
+        "le catalogue doit contenir au moins une entrée"
+    );
+    ensure!(
+        choices.len() <= MAX_ENTRIES,
+        "trop d'entrées dans le catalogue"
+    );
     let unique: std::collections::HashSet<&str> =
         choices.iter().map(|c| c.entry_id.as_str()).collect();
-    ensure!(unique.len() == choices.len(), "une entrée est listée deux fois");
+    ensure!(
+        unique.len() == choices.len(),
+        "une entrée est listée deux fois"
+    );
 
     // Index des métadonnées par entry_id
-    let meta_map: HashMap<&str, &EntryMeta> =
-        entries_meta.iter().map(|m| (m.entry_id.as_str(), m)).collect();
+    let meta_map: HashMap<&str, &EntryMeta> = entries_meta
+        .iter()
+        .map(|m| (m.entry_id.as_str(), m))
+        .collect();
 
     // ID publics stables (réutilisés d'une publication à l'autre)
     let mut ids: HashMap<String, String> = HashMap::new();
@@ -255,7 +266,10 @@ pub fn export_catalogue(
 
     // Trié par public_id (ordre arbitraire, ne divulgue pas le choix du propriétaire)
     catalogue_entries.sort_by(|a, b| {
-        a["public_id"].as_str().unwrap_or("").cmp(b["public_id"].as_str().unwrap_or(""))
+        a["public_id"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["public_id"].as_str().unwrap_or(""))
     });
 
     // Liste des ancres dans le catalogue
@@ -351,8 +365,8 @@ pub fn export_catalogue(
 /// Vérifie la signature d'un catalogue JSON (clé publique hex32 du document).
 /// Retourne Ok(()) si valide, Err sinon.
 pub fn verify_signature(catalogue_json: &[u8]) -> Result<()> {
-    let doc: Value = serde_json::from_slice(catalogue_json)
-        .map_err(|e| anyhow!("JSON invalide : {e}"))?;
+    let doc: Value =
+        serde_json::from_slice(catalogue_json).map_err(|e| anyhow!("JSON invalide : {e}"))?;
     let sig_hex = doc["signature"].as_str().unwrap_or("");
     let pub_hex = doc["public_key"].as_str().unwrap_or("");
     ensure!(!sig_hex.is_empty(), "catalogue non signé");
@@ -393,9 +407,8 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut temp = tempfile::NamedTempFile::new_in(
-        path.parent().unwrap_or_else(|| Path::new(".")),
-    )?;
+    let mut temp =
+        tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
     temp.write_all(data)?;
     temp.as_file().sync_all()?;
     temp.persist(path).map_err(|e| e.error)?;
@@ -509,7 +522,10 @@ mod tests {
         let bytes = canonical_catalogue(&doc).unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
         // Les clés doivent être triées et "signature" absente
-        assert!(!s.contains("signature"), "signature présente dans le canonique");
+        assert!(
+            !s.contains("signature"),
+            "signature présente dans le canonique"
+        );
         assert!(s.contains("\"a_key\""), "a_key absent");
         assert!(s.contains("\"z_key\""), "z_key absent");
         // Ordre trié : a_key avant z_key

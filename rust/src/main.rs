@@ -11,10 +11,37 @@ use zeroize::Zeroizing;
 )]
 struct Args {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum Command {
+    ChangePassphrase {
+        vault: PathBuf,
+    },
+    RecoverAccess {
+        vault: PathBuf,
+    },
+    RotateRecoveryKey {
+        vault: PathBuf,
+    },
+    Memory {
+        #[arg(long)]
+        database: Option<PathBuf>,
+        #[arg(long)]
+        database_key_env: Option<String>,
+        #[command(subcommand)]
+        action: MemoryCommand,
+    },
+    Head {
+        /// Dossier du journal ; par défaut <dépôt>/.empreinte-head.
+        #[arg(long)]
+        memory: Option<PathBuf>,
+        /// Racine du dépôt ; par défaut le dépôt Git qui contient le dossier courant.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[command(subcommand)]
+        action: HeadCommand,
+    },
     Init {
         vault: PathBuf,
     },
@@ -38,14 +65,327 @@ enum Command {
         port: u16,
     },
 }
+#[derive(Subcommand)]
+enum HeadCommand {
+    Status,
+    Recall {
+        query: String,
+        #[arg(long, default_value_t = 12000)]
+        budget: usize,
+    },
+    Record {
+        file: PathBuf,
+    },
+    ProposeRule {
+        file: PathBuf,
+    },
+    /// Déplace les lignes écartées en quarantaine ; l'ancien journal est gardé entier.
+    Repair,
+    /// Liste les contrôles autorisés de .agents/checks.json.
+    Checks,
+    /// Lance le contrôle nommé pour la tâche et enregistre son résultat.
+    Check {
+        task: String,
+        name: String,
+    },
+    /// Liste les règles de .agents/rules, leur état et leur dernière évaluation.
+    Rules,
+    /// Lance les contrôles réfutants de la règle et enregistre les mesures.
+    Evaluate {
+        rule: String,
+    },
+    /// Rend active une règle évaluée (évaluation réussie et à jour exigée).
+    Promote {
+        rule: String,
+    },
+    /// Annule la dernière promotion de la règle.
+    Rollback {
+        rule: String,
+    },
+    /// Retire une règle.
+    Retire {
+        rule: String,
+    },
+    /// Compare les mesures de deux règles, sans rien décider.
+    Compare {
+        a: String,
+        b: String,
+    },
+}
+#[derive(Subcommand)]
+enum MemoryCommand {
+    EncryptCopy {
+        destination: PathBuf,
+        #[arg(long)]
+        new_key_env: String,
+    },
+    Recover,
+    Runs,
+    Profile,
+    SetProfile {
+        file: PathBuf,
+        #[arg(long)]
+        reason: String,
+    },
+    RestoreProfile {
+        revision: i64,
+    },
+    Prepare {
+        file: PathBuf,
+    },
+    Run {
+        id: String,
+    },
+    Execute {
+        id: String,
+        #[arg(long)]
+        approve: String,
+        #[arg(long)]
+        key_env: Option<String>,
+    },
+    Cancel {
+        id: String,
+    },
+    Feedback {
+        id: String,
+        #[arg(long, allow_hyphen_values = true)]
+        rating: i64,
+        #[arg(long)]
+        note: String,
+    },
+    Adapt,
+    Export,
+    Forget {
+        provider: String,
+        id: String,
+        #[arg(long)]
+        confirm: bool,
+    },
+    Sync {
+        folder: PathBuf,
+        #[arg(long)]
+        follow: bool,
+    },
+    Stats,
+    Import {
+        file: PathBuf,
+        #[arg(long,default_value="normalized",value_parser=["normalized","chatgpt","claude"])]
+        format: String,
+    },
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 4000)]
+        budget: usize,
+    },
+    Get {
+        id: String,
+    },
+    Rebuild,
+    Mcp,
+    Ask {
+        query: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long, default_value = "http://127.0.0.1:11434/v1/chat/completions")]
+        endpoint: String,
+        #[arg(long, default_value_t = 4000)]
+        budget: usize,
+    },
+}
+fn memory_command(
+    database: Option<PathBuf>,
+    database_key_env: Option<String>,
+    action: MemoryCommand,
+) -> Result<()> {
+    use empreinte::conversations::{self, Store};
+    use std::io::Read;
+    let database = database
+        .or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map(|p| PathBuf::from(p).join("Empreinte/conversations.sqlite"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|p| PathBuf::from(p).join(".local/share/empreinte/conversations.sqlite"))
+        })
+        .ok_or_else(|| anyhow::anyhow!("fournir --database"))?;
+    let key = database_key_env
+        .map(|name| std::env::var(name).map(Zeroizing::new))
+        .transpose()?;
+    let mut store = Store::open_with_key(&database, key.as_ref().map(|k| k.as_str()))?;
+    let result = match action {
+        MemoryCommand::EncryptCopy {
+            destination,
+            new_key_env,
+        } => {
+            let key = Zeroizing::new(std::env::var(new_key_env)?);
+            store.encrypted_copy(&destination, &key)?
+        }
+        MemoryCommand::Recover => store.recover_runs()?,
+        MemoryCommand::Runs => store.list_runs()?,
+        MemoryCommand::Profile => store.profile()?,
+        MemoryCommand::SetProfile { file, reason } => {
+            store.set_profile(read_config(&file)?, &reason)?
+        }
+        MemoryCommand::RestoreProfile { revision } => store.restore_profile(revision)?,
+        MemoryCommand::Prepare { file } => store.prepare(read_config(&file)?)?,
+        MemoryCommand::Run { id } => store.run(&id)?,
+        MemoryCommand::Execute {
+            id,
+            approve,
+            key_env,
+        } => store.execute_run(&id, &approve, key_env.as_deref())?,
+        MemoryCommand::Cancel { id } => store.cancel_run(&id)?,
+        MemoryCommand::Feedback { id, rating, note } => store.feedback(&id, rating, &note)?,
+        MemoryCommand::Adapt => store.adapt()?,
+        MemoryCommand::Export => store.export_conversations()?,
+        MemoryCommand::Forget {
+            provider,
+            id,
+            confirm,
+        } => {
+            ensure!(
+                confirm,
+                "--confirm requis : purge aussi les plans/résultats/feedback qui référencent cette conversation"
+            );
+            store.forget(&provider, &id)?
+        }
+        MemoryCommand::Sync { folder, follow } => loop {
+            let report = store.sync(&folder)?;
+            if !follow {
+                break report;
+            }
+            println!("{report}");
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        },
+        MemoryCommand::Stats => store.stats()?,
+        MemoryCommand::Import { file, format } => {
+            let mut bytes = Vec::new();
+            std::fs::File::open(file)?
+                .take(64 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(
+                bytes.len() <= 64 * 1024 * 1024,
+                "export supérieur à 64 Mio : fractionner avant import"
+            );
+            store.import(conversations::decode(
+                serde_json::from_slice(&bytes)?,
+                &format,
+            )?)?
+        }
+        MemoryCommand::Search { query, budget } => store.search(&query, budget)?,
+        MemoryCommand::Get { id } => store.get(&id)?,
+        MemoryCommand::Rebuild => {
+            store.rebuild()?;
+            store.stats()?
+        }
+        MemoryCommand::Mcp => return conversations::mcp(&store),
+        MemoryCommand::Ask {
+            query,
+            model,
+            endpoint,
+            budget,
+        } => conversations::ask(&store, &endpoint, &model, &query, budget)?,
+    };
+    println!("{result}");
+    Ok(())
+}
+fn read_config<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(65537)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 65536, "configuration trop grande");
+    Ok(serde_json::from_slice(&bytes)?)
+}
 fn pass() -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(rpassword::prompt_password(
         "Phrase de passe : ",
     )?))
 }
+fn new_passphrase() -> Result<Zeroizing<String>> {
+    let first = Zeroizing::new(rpassword::prompt_password("Nouvelle phrase de passe : ")?);
+    let second = Zeroizing::new(rpassword::prompt_password("Confirmer : ")?);
+    ensure!(
+        !first.is_empty() && *first == *second,
+        "phrases vides ou différentes"
+    );
+    Ok(first)
+}
 #[tokio::main]
 async fn main() -> Result<()> {
-    match Args::parse().command {
+    match Args::parse().command.unwrap_or(Command::Demo { port: 0 }) {
+        Command::ChangePassphrase { vault } => {
+            let old = pass()?;
+            let mut v = Vault::open(&vault, &old)?;
+            let new = new_passphrase()?;
+            v.change_passphrase(&old, &new)?;
+            println!("Phrase de passe modifiée ; clé de secours inchangée.");
+        }
+        Command::RecoverAccess { vault } => {
+            let recovery = Zeroizing::new(rpassword::prompt_password("Clé de secours : ")?);
+            let mut v = Vault::open_recovery(&vault, &recovery)?;
+            let new = new_passphrase()?;
+            v.reset_passphrase(&new)?;
+            println!(
+                "Accès rétabli ; clé de secours inchangée. Aucune réparation du registre effectuée."
+            );
+        }
+        Command::RotateRecoveryKey { vault } => {
+            let mut v = Vault::open(&vault, &pass()?)?;
+            let recovery = v.rotate_recovery_key()?;
+            println!(
+                "Nouvelle clé de secours (ancienne invalidée pour ce coffre) :\n{}",
+                recovery.as_str()
+            );
+        }
+        Command::Memory {
+            database,
+            database_key_env,
+            action,
+        } => {
+            tokio::task::spawn_blocking(move || memory_command(database, database_key_env, action))
+                .await??
+        }
+        Command::Head {
+            memory,
+            repo,
+            action,
+        } => {
+            use empreinte::head;
+            let repo = match repo {
+                Some(path) => path.canonicalize()?,
+                None => head::find_repo(&std::env::current_dir()?)?,
+            };
+            let memory = memory.unwrap_or_else(|| repo.join(".empreinte-head"));
+            let candidate = matches!(&action, HeadCommand::ProposeRule { .. });
+            let result = match action {
+                HeadCommand::Check { task, name } => head::run_check(&memory, &repo, &task, &name)?,
+                HeadCommand::Checks => head::checks::load(&repo)?.describe(),
+                HeadCommand::Rules => head::rules::report(&head::Memory::open(&memory, &repo)?),
+                HeadCommand::Evaluate { rule } => head::rules::evaluate(&memory, &repo, &rule)?,
+                HeadCommand::Promote { rule } => head::rules::promote(&memory, &repo, &rule)?,
+                HeadCommand::Rollback { rule } => head::rules::rollback(&memory, &repo, &rule)?,
+                HeadCommand::Retire { rule } => head::rules::retire(&memory, &repo, &rule)?,
+                HeadCommand::Compare { a, b } => head::rules::compare(&memory, &repo, &a, &b)?,
+                HeadCommand::Repair => head::Memory::open(&memory, &repo)?.repair()?,
+                HeadCommand::Status => head::Memory::open(&memory, &repo)?.status(),
+                HeadCommand::Recall { query, budget } => {
+                    head::Memory::open(&memory, &repo)?.recall(&query, budget)
+                }
+                HeadCommand::Record { file } | HeadCommand::ProposeRule { file } => {
+                    let mut input = head::read_input(&file)?;
+                    if candidate {
+                        input.kind = "candidate".into();
+                    }
+                    let mut journal = head::Memory::open(&memory, &repo)?;
+                    journal.record(input)?;
+                    journal.status()
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         Command::Init { vault } => {
             let first = pass()?;
             let second = Zeroizing::new(rpassword::prompt_password("Confirmer : ")?);

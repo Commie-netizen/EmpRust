@@ -15,7 +15,25 @@ fn main() -> Result<()> {
             None,
         )?;
         v.aux_put("interop", b"rust-aux")?;
+        let id = s(&v.entries()[0], "entry_id");
+        let grant = v.grant(
+            &serde_json::json!({"licensee":"Interop", "usage":"test", "items":[{"entry_id":id}]}),
+        )?;
+        v.record_royalty(&serde_json::json!({"license_id":grant["license_id"],"amount":1.25}))?;
+        v.export_bundle(
+            &s(&grant, "license_id"),
+            &path.parent().unwrap().join("exports"),
+        )?;
         ensure!(v.verify()["ok"] == true, "Rust verification failed");
+        v.change_passphrase("interop-test-only", "temporary-test-password")?;
+        let recovery = v.rotate_recovery_key()?;
+        drop(v);
+        let mut v = Vault::open_recovery(path, &recovery)?;
+        v.reset_passphrase("interop-test-only")?;
+        std::fs::write(
+            path.parent().unwrap().join("test-only-recovery.txt"),
+            recovery.as_bytes(),
+        )?;
     } else {
         let mut v = Vault::open(path, "interop-test-only")?;
         let e = v
@@ -24,7 +42,7 @@ fn main() -> Result<()> {
             .find(|e| e["path"] == "Python/école.md")
             .unwrap();
         ensure!(
-            &*v.read(&s(&e, "entry_id"), None)? == "Créé en Python 🐍".as_bytes(),
+            v.read(&s(&e, "entry_id"), None)?.as_slice() == "Créé en Python 🐍".as_bytes(),
             "Python plaintext differs"
         );
         ensure!(

@@ -126,9 +126,7 @@ impl FolderState {
         let obj: serde_json::Map<String, Value> = self
             .known
             .iter()
-            .map(|(k, FileSig(sz, mt))| {
-                (k.clone(), json!([*sz, *mt]))
-            })
+            .map(|(k, FileSig(sz, mt))| (k.clone(), json!([*sz, *mt])))
             .collect();
         serde_json::to_vec(&Value::Object(obj)).unwrap_or_default()
     }
@@ -148,6 +146,11 @@ pub struct Watcher {
     pub last_error: String,
 }
 
+impl Default for Watcher {
+    fn default() -> Self {
+        Self::new(DEFAULT_QUIET_SECS, MAX_BYTES)
+    }
+}
 impl Watcher {
     pub fn new(quiet: f64, max_bytes: usize) -> Self {
         Watcher {
@@ -159,10 +162,6 @@ impl Watcher {
             last_capture: None,
             last_error: String::new(),
         }
-    }
-
-    pub fn default() -> Self {
-        Watcher::new(DEFAULT_QUIET_SECS, MAX_BYTES)
     }
 
     /// Charge les dossiers et leur état depuis les aux chiffrés du vault.
@@ -217,7 +216,11 @@ impl Watcher {
                 match state.pending.get(&rel).copied() {
                     None => {
                         let age = now - source.mtime_secs;
-                        let since = if age >= self.quiet { now - self.quiet } else { now };
+                        let since = if age >= self.quiet {
+                            now - self.quiet
+                        } else {
+                            now
+                        };
                         state.pending.insert(rel.clone(), (source.sig, since));
                     }
                     Some((prev_sig, _)) if prev_sig != source.sig => {
@@ -228,7 +231,10 @@ impl Watcher {
                 }
                 if let Some((_, since)) = state.pending.get(&rel) {
                     if now - since >= self.quiet {
-                        due.push(Due { folder: folder.clone(), source });
+                        due.push(Due {
+                            folder: folder.clone(),
+                            source,
+                        });
                     }
                 }
             }
@@ -260,10 +266,9 @@ impl Watcher {
                     // Instable ou trop grand : repart de zéro pour la quiet period
                     let key = item.folder.state_key();
                     if let Some(state) = self.states.get_mut(&key) {
-                        state.pending.insert(
-                            item.source.rel_path.clone(),
-                            (item.source.sig, unix_secs()),
-                        );
+                        state
+                            .pending
+                            .insert(item.source.rel_path.clone(), (item.source.sig, unix_secs()));
                     }
                 }
             }
@@ -419,7 +424,9 @@ pub fn add_folder(
     forbidden: &[&Path],
 ) -> Result<()> {
     ensure!(path.is_absolute(), "le chemin doit être absolu");
-    let resolved = path.canonicalize().map_err(|_| anyhow!("ce dossier n'existe pas"))?;
+    let resolved = path
+        .canonicalize()
+        .map_err(|_| anyhow!("ce dossier n'existe pas"))?;
     ensure!(resolved.is_dir(), "ce chemin n'est pas un dossier");
 
     for fb in forbidden {
@@ -431,7 +438,12 @@ pub fn add_folder(
         }
     }
     for existing in folders.iter() {
-        if existing.path.canonicalize().unwrap_or_else(|_| existing.path.clone()) == resolved {
+        if existing
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| existing.path.clone())
+            == resolved
+        {
             return Err(anyhow!("ce dossier est déjà suivi"));
         }
         if existing.prefix == prefix {
@@ -440,7 +452,10 @@ pub fn add_folder(
             ));
         }
     }
-    ensure!(folders.len() < MAX_FOLDERS, "au plus {MAX_FOLDERS} dossiers suivis");
+    ensure!(
+        folders.len() < MAX_FOLDERS,
+        "au plus {MAX_FOLDERS} dossiers suivis"
+    );
 
     folders.push(WatchedFolder {
         path: resolved,
@@ -524,7 +539,10 @@ fn stable_read(path: &Path, max_bytes: usize) -> Result<(Vec<u8>, FileSig)> {
     };
     let (content1, sig1) = read_once(path)?;
     let (content2, sig2) = read_once(path)?;
-    ensure!(sig1 == sig2 && content1 == content2, "fichier instable entre les deux lectures");
+    ensure!(
+        sig1 == sig2 && content1 == content2,
+        "fichier instable entre les deux lectures"
+    );
     Ok((content1, sig1))
 }
 
@@ -578,8 +596,12 @@ mod tests {
     #[test]
     fn folder_state_roundtrip() {
         let mut state = FolderState::default();
-        state.known.insert("a.txt".to_string(), FileSig(42, 1234567890));
-        state.known.insert("b.md".to_string(), FileSig(100, 9876543210));
+        state
+            .known
+            .insert("a.txt".to_string(), FileSig(42, 1234567890));
+        state
+            .known
+            .insert("b.md".to_string(), FileSig(100, 9876543210));
         let json = state.to_json();
         let restored = FolderState::from_aux(&json);
         assert_eq!(restored.known.get("a.txt"), Some(&FileSig(42, 1234567890)));

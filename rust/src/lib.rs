@@ -1,7 +1,10 @@
 pub mod anchor;
 pub mod catalogue;
 pub mod context;
+pub mod conversations;
 pub mod crypto;
+pub mod harness;
+pub mod head;
 pub mod server;
 pub mod vault;
 pub mod watch;

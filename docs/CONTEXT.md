@@ -172,11 +172,22 @@ Première tranche : CLI locale de mémoire, sans modèle ni exécution autonome.
 - Pas de dépendance Obsidian — **non encore commencé**
 
 ### Rust — environnement
+Paquet Windows natif de test créé le 16 novembre : voir
+`docs/reviews/2026-11-16-windows-package.md`. CLI/MCP/chiffrement et démo validés
+sur Windows ; double-clic sur le `.exe` lance maintenant la démo.
 - Build : `wsl -d Ubuntu -- cargo ... --target-dir /root/empreinte-target`
 - Pas de cargo Windows natif.
 - Interop driver : `/root/empreinte-target/debug/examples/interop`
 
 ### Reprise Codex — licences Rust (15 novembre 2026)
+
+Suite du 16 novembre : gestion des accès portée dans `vault.rs` et CLI :
+`change-passphrase`, `recover-access`, `rotate-recovery-key`. Parser Base32 avec
+checksum ; remplacement atomique de l'en-tête, échec d'écriture bloquant.
+55 tests unitaires + 18 tests de cycle harness passent ; interop Python/Rust
+confirme la clé de secours renouvelée et la nouvelle enveloppe de phrase de passe.
+Cette récupération concerne l'accès, pas la réparation d'un registre corrompu.
+Le paquet Windows précédent n'inclut pas encore ces nouvelles commandes.
 
 Ce point précise les mentions « complet » ci-dessus : la parité Python reste partielle.
 `vault.rs` crée les licences et redevances chiffrées, exporte les versions choisies

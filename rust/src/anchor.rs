@@ -16,7 +16,7 @@ pub const OID_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
 
 // Maximum limits
 pub const MAX_TOKEN_BYTES: usize = 256 * 1024;
-pub const MAX_PROOF_CHARS: usize = 4 * ((MAX_TOKEN_BYTES + 2) / 3);
+pub const MAX_PROOF_CHARS: usize = 4 * MAX_TOKEN_BYTES.div_ceil(3);
 
 // ==============================================================================
 // DER Node Parser
@@ -173,7 +173,7 @@ pub fn read_time(node: &DerNode) -> Result<DateTime<Utc>> {
         }
         micros_str.truncate(6);
         let micros: u32 = micros_str.parse()?;
-        dt = dt + chrono::Duration::microseconds(micros as i64);
+        dt += chrono::Duration::microseconds(micros as i64);
     }
 
     Ok(dt)
@@ -208,9 +208,9 @@ pub fn enc_int(value: i64) -> Vec<u8> {
     let raw = value.to_be_bytes();
     let mut start = 0;
     while start + 1 < raw.len() {
-        if raw[start] == 0 && (raw[start + 1] & 0x80) == 0 {
-            start += 1;
-        } else if raw[start] == 0xFF && (raw[start + 1] & 0x80) != 0 {
+        if (raw[start] == 0 && (raw[start + 1] & 0x80) == 0)
+            || (raw[start] == 0xFF && (raw[start + 1] & 0x80) != 0)
+        {
             start += 1;
         } else {
             break;
@@ -399,7 +399,7 @@ pub fn extract_tstinfo(token_or_resp_der: &[u8]) -> Result<(TstInfo, Vec<u8>)> {
 }
 
 /// Evaluates a base64 DER token against the vault's head hash.
-/// Returns status: "proven", "claimed", or "invalid".
+/// Returns "claimed" or "invalid"; TSA signature/trust verification is not implemented.
 pub fn evaluate_token(proof_b64: &str, expected_head_hash: &[u8]) -> Result<Value> {
     if proof_b64.len() > MAX_PROOF_CHARS {
         bail!("preuve d'ancrage trop volumineuse");
@@ -478,7 +478,8 @@ pub fn evaluate_token(proof_b64: &str, expected_head_hash: &[u8]) -> Result<Valu
     let iso_date = tst.gen_time.to_rfc3339();
 
     Ok(json!({
-        "status": "proven",
+        // Parsing and matching a digest do not authenticate the TSA signature or trust chain.
+        "status": "claimed",
         "anchored_at": iso_date,
         "serial": tst.serial_number,
         "policy": tst.policy
@@ -517,7 +518,7 @@ mod tests {
     fn evaluates_token_match_and_mismatch() {
         let b64 = include_str!("../../tools/openssl_resp.b64").trim();
         let res = evaluate_token(b64, &OPENSSL_DIGEST).unwrap();
-        assert_eq!(res["status"], "proven");
+        assert_eq!(res["status"], "claimed");
 
         let mut wrong = OPENSSL_DIGEST;
         wrong[0] ^= 0xFF;

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import runpy
 
 from empreinte.crypto import TEST_KDF
 from empreinte.vault import Vault
@@ -51,7 +52,16 @@ def main():
         assert vault.verify().ok, vault.verify().errors
         assert vault.read(vault.find("Rust/école.md").entry_id) == "Créé en Rust 🦀".encode()
         assert vault.aux_get("interop") == b"rust-aux"
+        assert len(vault.licenses()) == 1
+        assert vault.royalties()[0].amount == 1.25
         vault.close()
+        vault = Vault.open_with_recovery_key(native, (root / "test-only-recovery.txt").read_text())
+        assert vault.verify().ok
+        vault.close()
+        verifier = runpy.run_path(str(Path(__file__).with_name("verify_bundle.py")))
+        bundle = next((root / "exports").iterdir())
+        report = verifier["verify"](bundle, [])
+        assert report["ok"], report
     print("Python -> Rust -> Python and Rust -> Python: all checks passed")
 
 

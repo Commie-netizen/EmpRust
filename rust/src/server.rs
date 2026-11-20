@@ -243,7 +243,7 @@ fn dispatch(
     }
     if path == "/api/status" && method == Method::GET {
         return Ok(
-            json!({"exists":app.path.join("header.json").is_file(),"unlocked":state.session.as_ref().is_some_and(|s|equal(&s.token,token)),"demo":app.demo,"features":{"import":true,"previews":false,"export":false,"watch":false,"anchor_methods":[]},"idle_timeout":900,"retry_after":state.retry.saturating_duration_since(Instant::now()).as_secs(),"runtime":"rust","coverage":null,"watch":null}),
+            json!({"exists":app.path.join("header.json").is_file(),"unlocked":state.session.as_ref().is_some_and(|s|equal(&s.token,token)),"demo":app.demo,"features":{"import":true,"previews":false,"export":true,"watch":false,"anchor_methods":[]},"idle_timeout":900,"retry_after":state.retry.saturating_duration_since(Instant::now()).as_secs(),"runtime":"rust","coverage":null,"watch":null}),
         );
     }
     if path == "/api/lock" && method == Method::POST {
@@ -392,21 +392,10 @@ fn operation(
         }
         ("GET", "/api/anchors") => return Ok(json!(v.anchors)),
         ("POST", "/api/verify") => return Ok(v.verify()),
-        ("GET", "/api/licenses") | ("GET", "/api/royalties") => {
-            let field = if path.ends_with("licenses") {
-                "licenses"
-            } else {
-                "royalties"
-            };
-            return Ok(json!(
-                v.catalog[field]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|r| serde_json::from_str::<Value>(&s(r, "committed")).ok())
-                    .collect::<Vec<_>>()
-            ));
-        }
+        ("GET", "/api/licenses") => return Ok(json!(v.licenses()?)),
+        ("POST", "/api/licenses") => return v.grant(body),
+        ("GET", "/api/royalties") => return Ok(json!(v.royalties(param(query, "license_id"))?)),
+        ("POST", "/api/royalties") => return v.record_royalty(body),
         ("GET", "/api/prefs") => {
             return Ok(v
                 .aux_get("ui.prefs.v1")?
@@ -427,6 +416,24 @@ fn operation(
         _ => {}
     }
     let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    if method == Method::POST
+        && parts.len() == 4
+        && parts[0] == "api"
+        && parts[1] == "licenses"
+        && parts[3] == "export"
+    {
+        let name = v
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("empreinte");
+        let output = v
+            .path
+            .parent()
+            .ok_or_else(|| anyhow!("dossier parent absent"))?
+            .join(format!("{name}-licences"));
+        return v.export_bundle(parts[2], &output);
+    }
     if parts.len() >= 3 && parts[0] == "api" && parts[1] == "entries" {
         let id = parts[2];
         let number = param(query, "version")
@@ -536,6 +543,13 @@ pub async fn serve(path: PathBuf, port: u16, demo: bool) -> Result<()> {
         }
     });
     println!("Empreinte Rust : http://127.0.0.1:{port}/");
+    #[cfg(windows)]
+    if demo {
+        let _ = std::process::Command::new("rundll32.exe")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(format!("http://127.0.0.1:{port}/"))
+            .spawn();
+    }
     let permits = Arc::new(tokio::sync::Semaphore::new(32));
     let mut jobs = tokio::task::JoinSet::new();
     loop {
@@ -625,6 +639,75 @@ mod tests {
             call(app, "GET", "/api/entries", &token, json!({})).await.0,
             StatusCode::UNAUTHORIZED
         );
+    }
+    #[tokio::test]
+    async fn license_royalty_export_require_session_and_roundtrip() {
+        let (_temp, app) = fixture();
+        assert_eq!(
+            call(app.clone(), "POST", "/api/licenses", "", json!({}))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let (_, auth) = call(
+            app.clone(),
+            "POST",
+            "/api/unlock",
+            "",
+            json!({"passphrase":"test"}),
+        )
+        .await;
+        let token = s(&auth, "unlock_token");
+        let (_, entries) = call(app.clone(), "GET", "/api/entries", &token, json!({})).await;
+        let (status, grant) = call(app.clone(), "POST", "/api/licenses", &token, json!({"licensee":"Test", "usage":"Evaluation", "items":[{"entry_id":entries[0]["entry_id"]}]})).await;
+        assert_eq!(status, StatusCode::OK, "{grant}");
+        let id = s(&grant, "license_id");
+        assert_eq!(
+            call(
+                app.clone(),
+                "POST",
+                "/api/royalties",
+                &token,
+                json!({"license_id":id,"amount":12.5})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let (_, events) = call(
+            app.clone(),
+            "GET",
+            &format!("/api/royalties?license_id={id}"),
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        let (_, other) = call(
+            app.clone(),
+            "GET",
+            "/api/royalties?license_id=unknown",
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(other, json!([]));
+        let (status, export) = call(
+            app.clone(),
+            "POST",
+            &format!("/api/licenses/{id}/export"),
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{export}");
+        assert!(
+            Path::new(&s(&export, "path"))
+                .join("manifest.json")
+                .is_file()
+        );
+        let (_, grants) = call(app, "GET", "/api/licenses", &token, json!({})).await;
+        assert_eq!(grants[0]["bundle_hash"], export["bundle_hash"]);
     }
     #[tokio::test]
     async fn second_client_cannot_replace_or_lock_session() {
