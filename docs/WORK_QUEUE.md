@@ -10,7 +10,7 @@ qui reprend le projet. Une seule source de vérité pour ce qui reste à faire.
 | T1 | Corriger les 12 constats de l'audit de la tête pensante | docs/plans/2026-11-16-corrections-tete.md | à faire |
 | T2 | Connecteur d'IA et tâches planifiées | docs/plans/2026-11-20-connecteur-ia.md | à faire |
 | T3 | Audit Codex en lecture seule de T1 et T2, puis corrections | ce fichier, section T3 | bloquée par T1 et T2 |
-| T4 | Publier sur GitHub (dépôt privé Commie-netizen/empreinte) | ce fichier, section T4 | bloquée : dépôt à créer par le propriétaire |
+| T4 | Publier sur GitHub (dépôt privé Commie-netizen/empreinte) | ce fichier, section T4 | faite le 2026-11-20 ; pousser après chaque tâche validée |
 
 États possibles : à faire, en cours, à vérifier, faite, bloquée (avec la raison).
 
@@ -38,10 +38,12 @@ de marquer T3 faite. Codex partage son quota avec d'autres sessions : en cas de 
 noter l'heure de réouverture et passer.
 
 ## T4. Publication
-Le dépôt GitHub doit être créé par le propriétaire (privé, vide, sans README) :
-https://github.com/new, nom `empreinte`, compte Commie-netizen. Le remote `origin` est déjà
-configuré. Ensuite : `git push -u origin main`. Ne jamais rendre le dépôt public sans
-accord explicite : les notes contiennent des chemins locaux.
+Dépôt privé https://github.com/Commie-netizen/empreinte, créé le 2026-11-20 avec GitHub
+CLI (`gh`, installé par winget dans le profil utilisateur, connecté au compte
+Commie-netizen). `main` suit `origin/main` : après chaque tâche validée, `git push`.
+Ne jamais rendre le dépôt public sans accord explicite : les notes contiennent des
+chemins locaux. Un dépôt public vide `EmpRust` existe aussi sur ce compte : ne rien y
+pousser.
 
 ## Règles permanentes
 - Ne jamais contacter une autorité d'horodatage, ne jamais appeler `memory execute`.
@@ -52,3 +54,5 @@ accord explicite : les notes contiennent des chemins locaux.
 ## Journal
 - 2026-11-20 : file créée. Tout le travail en attente validé (commit a3ba33c). Remote
   `origin` configuré ; dépôt GitHub absent.
+- 2026-11-20 : dépôt privé créé et historique complet poussé (main à a9fd7d2). T1 et T2
+  confiées à deux agents Opus 5.5 par la session principale.
