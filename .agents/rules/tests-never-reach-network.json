@@ -1,18 +1,18 @@
 {
   "id": "tests-never-reach-network",
   "origin": [
-    "15 novembre 2026 : un test d'ancrage a rouvert un coffre sans le faux transport et a envoyé une vraie requête à DigiCert ; garde ajoutée dans tests/conftest.py"
+    "15 novembre 2026 : un test d'ancrage a rouvert un coffre sans le faux transport et a envoyé une vraie requête à DigiCert",
+    "audit du 16 novembre (constat 12) : l'option --offline ne règle que le réseau de Cargo, pas celui des tests"
   ],
   "refuted_by": [
-    "python-tests",
     "cargo-test"
   ],
   "scope": [
-    "tests/",
-    "tools/verify_bundle.py",
-    "rust/src/"
+    "rust/src/",
+    "rust/tests/",
+    ".agents/checks.json"
   ],
   "state": "evaluated",
-  "statement": "Aucun test ne contacte un service extérieur : tests/conftest.py fait échouer tout appel à urllib pendant la suite Python, les autorités d'horodatage des tests sont factices, et les tests Rust tournent hors ligne (--offline).",
+  "statement": "Les tests Rust lancés par le contrôle cargo-test n'ont aucun accès réseau : sous Linux, l'outil les exécute dans un espace de noms réseau qui n'a que sa propre interface de bouclage, et ce contrôle exige cette isolation ; sans elle, son résultat ne passe pas. La suite Python n'est pas isolée : tests/conftest.py y bloque seulement urllib.",
   "version": 1
 }

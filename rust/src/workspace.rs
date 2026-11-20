@@ -4,7 +4,61 @@ use anyhow::Result;
 use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 use zeroize::Zeroizing;
+
+fn fold_search(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .nfkd()
+        .filter(|c| !is_combining_mark(*c))
+        .collect()
+}
+fn search_words(text: &str) -> Vec<String> {
+    fold_search(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+fn search_snippet(text: &str, terms: &[String]) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut first = None;
+    let mut start = 0;
+    while start < chars.len() {
+        while start < chars.len() && !chars[start].is_alphanumeric() {
+            start += 1;
+        }
+        let mut end = start;
+        while end < chars.len() && (chars[end].is_alphanumeric() || is_combining_mark(chars[end])) {
+            end += 1;
+        }
+        if start < end
+            && terms.contains(&fold_search(&chars[start..end].iter().collect::<String>()))
+        {
+            first = Some(start);
+            break;
+        }
+        start = end;
+    }
+    let pos = first.unwrap_or(0);
+    let begin = pos.saturating_sub(50).min(chars.len().saturating_sub(160));
+    chars[begin..chars.len().min(begin + 160)]
+        .iter()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn phrase_match(field: &str, phrase: &str) -> bool {
+    let field = fold_search(field);
+    field.match_indices(phrase).any(|(start, _)| {
+        let before = field[..start].chars().next_back();
+        let after = field[start + phrase.len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
 
 pub fn is_text(media: &str) -> bool {
     let m = media.split(';').next().unwrap_or("");
@@ -256,31 +310,99 @@ impl Workspace {
         )
     }
     pub fn search(&self, q: &str, limit: usize) -> Vec<Value> {
-        let terms = q
-            .to_lowercase()
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        let pieces = Regex::new(r#"\"([^\"]+)\"|(\S+)"#).unwrap();
+        let mut terms = Vec::new();
+        let mut phrases = Vec::new();
+        let mut last_prefix = None;
+        for piece in pieces.captures_iter(q) {
+            let quoted = piece.get(1);
+            let words = search_words(quoted.or_else(|| piece.get(2)).unwrap().as_str());
+            if let Some(phrase) = quoted {
+                phrases.push(fold_search(phrase.as_str()));
+            }
+            last_prefix = if quoted.is_none() {
+                words.last().cloned()
+            } else {
+                None
+            };
+            terms.extend(words);
+        }
+        let terms: Vec<String> = terms
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         if terms.is_empty() {
             return vec![];
         }
-        let mut hits = Vec::new();
+        let mut documents = Vec::new();
         for e in &self.entries {
             let id = s(e, "entry_id");
             let text = &self.texts[&id];
-            let lower =
-                format!("{} {} {}", s(e, "title"), s(e, "path"), text.as_str()).to_lowercase();
-            if terms.iter().all(|t| lower.contains(t)) {
-                let score = terms
-                    .iter()
-                    .map(|t| lower.matches(t).count().min(50))
-                    .sum::<usize>();
-                hits.push(json!({"entry_id":id,"title":e["title"],"path":e["path"],"snippet":text.chars().take(180).collect::<String>(),"score":score,"updated_at":e["updated_at"]}));
+            let words = search_words(&format!(
+                "{} {} {}",
+                s(e, "title"),
+                s(e, "path"),
+                text.as_str()
+            ));
+            let mut counts = BTreeMap::new();
+            for word in &words {
+                *counts.entry(word.clone()).or_insert(0usize) += 1;
             }
+            let phrase_ok = phrases.iter().all(|phrase| {
+                [s(e, "title"), s(e, "path"), text.to_string()]
+                    .iter()
+                    .any(|field| phrase_match(field, phrase))
+            });
+            documents.push((e, id, text, counts, words.len().max(1), phrase_ok));
         }
-        hits.sort_by_key(|h| std::cmp::Reverse(h["score"].as_u64().unwrap()));
-        hits.truncate(limit);
-        hits
+        let n = documents.len() as f64;
+        let avg = documents.iter().map(|d| d.4).sum::<usize>() as f64 / n.max(1.0);
+        let matches_term = |counts: &BTreeMap<String, usize>, term: &str| -> usize {
+            if last_prefix.as_deref() == Some(term) {
+                counts
+                    .iter()
+                    .filter(|(word, _)| word.starts_with(term))
+                    .map(|(_, n)| n)
+                    .sum()
+            } else {
+                *counts.get(term).unwrap_or(&0)
+            }
+        };
+        let df: Vec<usize> = terms
+            .iter()
+            .map(|t| {
+                documents
+                    .iter()
+                    .filter(|d| matches_term(&d.3, t) > 0)
+                    .count()
+            })
+            .collect();
+        let all = documents
+            .iter()
+            .any(|d| d.5 && terms.iter().all(|t| matches_term(&d.3, t) > 0));
+        let mut hits = Vec::new();
+        for (e, id, text, counts, length, phrase_ok) in documents {
+            let matches = terms
+                .iter()
+                .filter(|t| matches_term(&counts, t) > 0)
+                .count();
+            if !phrase_ok || matches == 0 || (all && matches != terms.len()) {
+                continue;
+            }
+            let score: f64 = terms
+                .iter()
+                .zip(&df)
+                .map(|(term, df)| {
+                    let tf = matches_term(&counts, term) as f64;
+                    let idf = (1.0 + (n - *df as f64 + 0.5) / (*df as f64 + 0.5)).ln();
+                    idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * length as f64 / avg))
+                })
+                .sum();
+            hits.push((score,id.clone(),json!({"entry_id":id,"title":e["title"],"path":e["path"],"snippet":search_snippet(text,&terms),"score":score,"updated_at":e["updated_at"]})));
+        }
+        hits.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        hits.into_iter().take(limit).map(|h| h.2).collect()
     }
     pub fn activity(&self, v: &Vault, basis: &str) -> Value {
         use chrono::{Datelike, Timelike};
@@ -314,5 +436,51 @@ impl Workspace {
             }
         }
         json!({"basis":basis,"days":days.into_values().collect::<Vec<_>>(),"hour_weekday":hours,"groups_by_month":{},"tags_by_month":{}})
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    fn workspace() -> Workspace {
+        let entries = vec![
+            json!({"entry_id":"a","title":"Long","path":"a.md"}),
+            json!({"entry_id":"b","title":"Court","path":"b.md"}),
+            json!({"entry_id":"c","title":"Autre","path":"c.md"}),
+        ];
+        let texts = [
+            ("a", format!("{} café", "mot ".repeat(100))),
+            ("b", "Café et vélo".to_owned()),
+            ("c", "vélo".to_owned()),
+        ]
+        .into_iter()
+        .map(|(id, text)| (id.to_string(), Zeroizing::new(text)))
+        .collect();
+        Workspace {
+            entries,
+            texts,
+            parsed: BTreeMap::new(),
+        }
+    }
+    #[test]
+    fn search_folds_accents_ranks_and_selects_relevant_snippet() {
+        let w = workspace();
+        let hits = w.search("CAFE", 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0]["entry_id"], "b");
+        assert!(hits[1]["snippet"].as_str().unwrap().contains("café"));
+        assert_eq!(w.search("cafe velo", 10)[0]["entry_id"], "b");
+        assert_eq!(w.search("cafe inconnu", 10).len(), 2);
+        assert!(w.search("!!!", 10).is_empty());
+        assert!(w.search("cafe", 0).is_empty());
+    }
+    #[test]
+    fn search_supports_final_prefix_and_quoted_phrases() {
+        let w = workspace();
+        assert_eq!(w.search("caf", 10).len(), 2);
+        assert_eq!(w.search("\"cafe et velo\"", 10)[0]["entry_id"], "b");
+        assert!(w.search("\"cafe velo\"", 10).is_empty());
+        assert!(w.search("\"caf\"", 10).is_empty());
+        assert_eq!(w.search("cafe vel", 10)[0]["entry_id"], "b");
     }
 }

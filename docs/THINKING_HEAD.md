@@ -1,172 +1,199 @@
 # Tête pensante — proposition v0.1
 
-Statut : journal durci, évaluateur et cycle de vie des règles implémentés (étapes 1 à 3),
-16 novembre 2026. Aucun agent autonome, aucun planificateur, aucun apprentissage
-automatique : chaque mouvement est une commande lancée par une personne.
+Statut : journal, évaluateur et cycle de vie des règles implémentés (étapes 1 à 3), puis
+corrigés après l'audit du 16 novembre (`docs/reviews/2026-11-16-audit-tete-pensante.md`,
+corrections dans `docs/reviews/2026-11-20-tete-corrections.md`), 20 novembre 2026. Aucun
+agent autonome, aucun planificateur, aucun apprentissage automatique : chaque mouvement
+est une commande lancée par une personne.
 
 ## Intention
 
 ### Prototype disponible
 
-Code : `rust/src/head/mod.rs` (journal), `rust/src/head/checks.rs` (évaluateur),
-`rust/src/head/rules.rs` (règles), tests dans `rust/src/head/tests.rs` (sans processus
-lancé) et `rust/tests/head_lifecycle.rs` (contrôles, git et règles, dans un binaire de
-test à part : un processus lancé pendant qu'un test d'un autre module tient un verrou
-rendait ce verrou momentanément occupé). Commandes, toutes sous
-`empreinte head [--repo <dépôt>] [--memory <dossier>]` :
-`status`, `recall "Rust"`, `record evenement.json`, `propose-rule regle.json`,
-`repair`, `checks`, `check <tâche> <contrôle>`, `rules`, `evaluate <règle>`,
-`promote <règle>`, `rollback <règle>`, `retire <règle>`, `compare <a> <b>`. Le dépôt est par défaut le dépôt Git
-qui contient le dossier courant ; le journal, `<dépôt>/.empreinte-head/` (ignoré par Git).
+Code : `rust/src/head/` : `mod.rs` (journal), `trust.rs` (dépôts de confiance),
+`fsafe.rs` (ouverture sans suivre de lien), `checks.rs` (évaluateur), `contain.rs`
+(confinement des processus), `tree.rs` (empreinte et instantané), `rules.rs` (règles).
+Tests : `rust/src/head/tests.rs` (sans processus lancé), `rust/tests/head_lifecycle.rs` et
+`rust/tests/head_audit.rs` (contrôles, git et règles, dans des binaires de test à part).
+Commandes, toutes sous `empreinte head [--repo <dépôt>] [--memory <dossier>]` :
+`trust <chemin> [--confirm]`, `status`, `recall "Rust"`, `record evenement.json`,
+`propose-rule regle.json`, `repair`, `checks`, `check <tâche> <contrôle>`, `rules`,
+`register <règle>`, `evaluate <règle>`, `promote <règle>`, `rollback <règle>`,
+`retire <règle>`, `compare <a> <b>`. Le journal est par défaut `<dépôt>/.empreinte-head/`
+(ignoré par Git).
 
-Exemple d'entrée (champs permis : event_id, task_id, kind, summary, source_refs,
-evidence_refs, supersedes ; tout autre champ, horodatage, empreintes, résultat de
-contrôle, commande ou permission, rend l'entrée invalide) :
-
-```json
-{"event_id":"task1-proposed","task_id":"task1","kind":"proposed","summary":"Ajouter la mémoire Rust","source_refs":["rust/src/head/mod.rs"],"evidence_refs":[]}
-```
+**Confiance.** L'outil ne lit `.agents` et ne lance rien que dans un dépôt que la personne
+a explicitement déclaré de confiance. La liste est hors de tout dépôt :
+`~/.config/empreinte/trusted-repos.json` (Unix, dossier personnel lu dans la base des
+comptes, pas dans l'environnement ; sous Windows, `%APPDATA%\Empreinte`). `head trust
+<chemin>` montre la racine, le contenu de la liste de contrôles et les fichiers de règles ;
+seul `--confirm` l'enregistre, avec l'empreinte de `.agents/checks.json`. Un `.git`
+trouvé ne suffit jamais : une commande utilise l'ancêtre de confiance le plus proche du
+dossier courant, ou refuse en disant comment faire confiance. Si la liste de contrôles
+change, plus rien ne tourne avant une nouvelle confiance. `.git` doit être un dossier
+ordinaire. `.agents`, `.agents/rules` et les fichiers qu'ils contiennent sont ouverts sous
+le descripteur du dossier déjà ouvert, sans suivre de lien (`openat` avec `O_NOFOLLOW`) :
+un lien à n'importe quel niveau est refusé.
 
 **Journal.** `events.jsonl`, en ajout seul, en clair : outil de développement, sans
 document personnel. Chaque événement du schéma 2 porte `schema_version`, `timestamp`
-(écrit par l'outil) et `supersedes` facultatif (un événement antérieur de la même
-tâche). Les événements plus anciens, sans `schema_version`, restent lisibles et sont
-marqués `legacy` ; ils ne sont jamais réécrits. Le verrou d'écrivain est un fichier
-séparé, `events.lock`, jamais écrit (il ne peut rien tronquer), refusé s'il est un lien
-ou n'est pas un fichier ordinaire, relâché à chaque échec ; une attente d'une seconde
-au plus, puis refus. Le journal lié, ou à plusieurs noms (lien physique, contrôlé sous
-Unix), est refusé.
+(écrit par l'outil) et `supersedes` facultatif. Les événements plus anciens restent
+lisibles, marqués `legacy`, jamais réécrits. Le verrou d'écrivain est `events.lock`,
+jamais écrit, refusé s'il est un lien ; avant chaque écriture, l'outil vérifie (Unix) que
+le verrou et le journal sont toujours les fichiers qu'il a ouverts : un verrou ou un
+journal remplacé par un autre processus arrête l'écriture. Un journal lié ou à plusieurs
+noms est refusé.
 
-**Lignes invalides.** Une ligne illisible, invalide, de plus de 256 Kio ou incomplète
-(écriture interrompue) est écartée : `status` et `recall` fonctionnent sur les lignes
-valides et indiquent combien de lignes sont écartées et leurs numéros. L'ajout suivant
-commence sur une nouvelle ligne, la ligne incomplète reste telle quelle. `repair` est
-la seule opération autre qu'un ajout : elle copie les lignes écartées, avec numéro,
-raison et contenu brut, dans `events.quarantine.jsonl`, garde l'ancien journal entier
-sous `events.before-repair-<date>.jsonl` et réécrit `events.jsonl` avec les lignes
-valides, octet pour octet. Pour annuler : remettre la sauvegarde à la place du journal.
-Le journal accepte des ajouts jusqu'à 16 Mio ; au-delà ils sont refusés, la lecture
-reste possible.
+**Lignes invalides.** Une ligne illisible, invalide, de plus de 256 Kio ou incomplète est
+écartée : `status` et `recall` fonctionnent sur les lignes valides et disent combien de
+lignes sont écartées et où. Avant toute écriture, une dernière ligne sans fin de ligne
+est scellée par le suffixe `~torn` : aucun analyseur JSON ne l'accepte, elle ne peut donc
+jamais devenir valide plus tard. `repair` est la seule opération autre qu'un ajout : il
+copie les lignes écartées dans `events.quarantine.jsonl`, écrit le nouveau journal, puis
+enregistre son intention (`repair-intent.json`) avant d'échanger les fichiers, en
+synchronisant le dossier. Si `events.jsonl` manque alors qu'une réparation a laissé une
+trace, l'outil refuse de créer un journal vide et dit comment remettre la sauvegarde.
 
 **Sources.** Une source doit être un fichier ordinaire d'au plus 1 Mio situé dans le
-dépôt après résolution des liens ; un lien final est refusé. Elle est enregistrée
-relative à la racine du dépôt avec son SHA-256 : le journal ne contient ni nom
-d'utilisateur, ni chemin extérieur, ni empreinte d'un fichier hors du dépôt. Les
-anciens chemins absolus restent dans le fichier : `recall` les montre relatifs s'ils
-sont dans le dépôt, sinon remplacés par `<hors du dépôt>` avec l'état `outside`, sans
-relire le fichier. `recall` ne relit que les sources des résultats retenus dans le
-budget et renvoie `current`, `changed`, `unavailable`, `untracked` ou `outside`.
+dépôt après résolution des liens ; elle est enregistrée relative à la racine avec son
+SHA-256. Les anciens chemins absolus hors du dépôt sont montrés `<hors du dépôt>`, jamais
+relus. `recall` ne relit que les sources des résultats retenus.
 
 **Recherche.** Lexicale, sur les résumés, plafond de 12 000 octets pour les
-enregistrements JSON retenus, hors enveloppe. La sortie déclare les textes comme
-données non fiables (`trust`, et `untrusted` sur chaque enregistrement).
+enregistrements retenus. Tout texte est marqué données non fiables. Chaque vérification
+et chaque résultat de contrôle retourné porte son état effectif (`effective`) :
+`verified` ou `verified-stale`, `certifies` ou `does-not-certify`, avec les raisons.
 
-**Évaluateur.** `.agents/checks.json`, versionné dans le dépôt, liste les contrôles
-autorisés : nom, commande en vecteur d'arguments par plateforme (`unix`, `windows`),
-répertoire de travail dans le dépôt, délai (1 à 7200 s), borne de sortie facultative.
-Aucun shell n'est invoqué par l'outil. Seul le nom du contrôle vient de la ligne de
-commande ; rien d'un enregistrement, d'une règle ou d'un texte retrouvé ne choisit le
-programme, un argument, le répertoire ou l'environnement. L'environnement du contrôle
-est vidé puis limité à une liste fixe de variables (`PASSTHROUGH` dans checks.rs).
-Au délai, tout le groupe de processus est tué sous Unix. `check` écrit lui-même un
-événement `check` : code de sortie, durée, empreinte de la sortie (jamais la sortie),
-empreinte du fichier de contrôles et révision du dépôt (HEAD, arbre modifié ou non,
-empreinte de `git status` et `git diff HEAD`). Le verrou du journal est relâché pendant
-le contrôle. Contrôles livrés : `cargo-test` (`cargo test --offline --locked`) et
-`python-tests` (pytest ; `tests/conftest.py` bloque tout accès réseau, coffres de test
-temporaires).
+**Évaluateur.** `.agents/checks.json` (version 2) liste les contrôles autorisés. Le
+programme est nommé par un chemin absolu ; un nom nu ou relatif est refusé, aucun chemin
+de recherche n'est consulté. Les arguments sont un vecteur, sans shell. Seul le nom du
+contrôle vient de la ligne de commande. L'environnement est construit, jamais hérité :
+`PATH=/usr/local/bin:/usr/bin:/bin`, `HOME=<cache>/home` (dossier privé de l'outil),
+`CARGO_HOME=<dossier personnel>/.cargo`, `RUSTUP_HOME=<dossier personnel>/.rustup`,
+`LANG=C.UTF-8`, `PYTHONDONTWRITEBYTECODE=1`, plus les variables que l'entrée liste avec
+leur valeur (`@cache` et `@home` y désignent le cache de l'outil et le dossier personnel).
+`<cache>` est `~/.cache/empreinte/head` (Unix). Chaque résultat enregistre le chemin du
+programme, le SHA-256 de son contenu et le SHA-256 de toute la configuration d'exécution
+(arguments, dossier, environnement, bornes, isolation, fichiers de configuration de Cargo
+sous `CARGO_HOME`) : un changement de l'un ou de l'autre rend le résultat périmé.
 
-**verified.** Une tâche n'est `verified` que si l'événement cite dans `evidence_refs`
-un contrôle réussi écrit par l'outil pour cette tâche et encore à jour au moment de
-l'enregistrement. Une affirmation libre s'enregistre comme `declared` et n'apparaît
-jamais comme vérifiée. `status` affiche `verified-stale`, avec les raisons, dès que le
-fichier de contrôles, la révision ou l'arbre de travail ont changé depuis le résultat.
-Une tâche `verified` d'un ancien journal (sans contrôle) est affichée `declared` avec
-`legacy`. Une tâche `running` s'affiche `interrupted` entre deux commandes, sans
-réécrire l'événement. `propose-rule` reste une simple note `candidate` dans le
-journal ; les règles versionnées sont décrites ci-dessous.
+**Instantané.** Les entrées d'un contrôle sont les fichiers suivis par Git et les fichiers
+non suivis non ignorés, hors `.agents/rules/` et `.empreinte-head/`. Git ne sert qu'à les
+lister (`ls-files`), confiné comme un contrôle, configuration système et globale
+désactivée, `core.fsmonitor`, `core.hooksPath` et `core.pager` neutralisés en ligne de
+commande, `--git-dir` et `--work-tree` explicites ; `ls-files` ne lance ni diff, ni
+conversion de texte, ni filtre, ni assistant d'identifiants. L'outil lit et hache lui-même
+chaque fichier. Les fichiers sont copiés, en lecture seule, dans un instantané privé sous
+`<cache>/snapshots`, et l'empreinte est calculée sur les octets écrits. Le contrôle tourne
+dans l'instantané ; s'il le modifie, son résultat est incomplet. Si la liste ou la lecture
+échoue (git absent, en échec, hors délai, sortie tronquée), rien n'est certifié : le
+résultat est incomplet. Le cache de compilation de Cargo est `<cache>/cargo-target`
+(variable `CARGO_TARGET_DIR` de l'entrée), hors de l'instantané.
 
-**Règles.** Une règle est un fichier `.agents/rules/<id>.json` : `version`, `id` (égal
-au nom du fichier), `statement`, `scope` et `origin` (texte), `refuted_by` (un à huit
-noms de contrôles, qui doivent exister dans `.agents/checks.json`), `replaces`
-facultatif (la règle qu'elle remplacerait) et `state`. Tout autre champ (commande,
-argument, chemin à lancer, variable d'environnement, permission) rend le fichier
-invalide ; de même un lien, un fichier de plus de 16 Kio ou hors de ce dossier. Un
-fichier invalide est signalé sans masquer les autres. Le texte d'une règle est une
-donnée : rien n'en est exécuté ni lu comme une instruction ; une évaluation ne lance
-que les contrôles nommés, avec les commandes, l'isolation et les délais de la liste.
+**Confinement.** Sous Linux, un contrôle tourne dans de nouveaux espaces de noms
+utilisateur, réseau et processus, créés sans privilège. Un gardien hors de l'espace des
+processus devient « subreaper » et lance le programme, qui est le PID 1 de cet espace et
+meurt avec le gardien. Quand il s'arrête, le noyau tue tout ce qui reste dans l'espace,
+`setsid` compris ; le gardien les récupère tous et rapporte le statut et la confirmation
+du nettoyage. Au délai, le gardien tue le PID 1. L'espace réseau n'a que sa propre
+interface de bouclage. Un contrôle n'est `passed` que s'il est sorti avec 0 dans son délai,
+que sa sortie a été lue entièrement dans sa borne, que le confinement et le nettoyage sont
+confirmés, que l'instantané est intact et, s'il l'exige (`requires_isolation`), que le
+réseau était isolé. Une sortie non nulle dans ces conditions est `failed` ; tout le reste
+est `incomplete`. Une entrée `uncontained` (programme Windows lancé depuis WSL, qui ne peut
+pas tourner dans ces espaces) tourne sans confinement : son résultat est toujours
+`incomplete` et ne certifie rien.
 
-États et seuls mouvements : candidate vers evaluated (évaluation réussie), evaluated
-vers active (`promote`), active vers evaluated (`rollback`, qui annule la dernière
-promotion), candidate, evaluated ou active vers retired (`retire`). Chaque mouvement
-est un événement `rule` écrit par l'outil avec les empreintes des fichiers avant et
-après et le texte exact d'avant ; le journal seul redonne l'état de chaque règle, et
-un fichier en désaccord avec lui (état ou contenu modifié hors de l'outil, fichier
-absent) est signalé par `rules` et `status` et bloque tout mouvement de cette règle.
-Un événement `rule` incohérent avec ce qui précède est écarté à la relecture. L'outil
-réécrit le fichier sous forme canonique (clés triées) quand il change son état.
+**verified.** Une tâche n'est `verified` que si l'événement cite un résultat `passed` écrit
+par l'outil pour cette tâche, dont l'instantané a l'empreinte de l'arbre de travail au
+moment de l'enregistrement, avec la même liste de contrôles, le même programme et la même
+configuration d'exécution. Une affirmation libre s'enregistre comme `declared`. `status`
+et `recall` affichent `verified-stale`, avec les raisons, dès que l'un de ces éléments
+change. Une tâche `verified` d'un ancien journal est affichée `declared`, `legacy`.
 
-`evaluate` lance les contrôles réfutants et enregistre, par contrôle, réussite, code,
-durée et empreinte de sortie, avec l'empreinte du fichier de contrôles et la révision
-du dépôt. L'évaluation est liée au contenu exact de la règle (empreinte sans l'état)
-et à l'état du dépôt : elle est périmée dès que la règle, le fichier de contrôles,
-HEAD ou l'arbre de travail changent. Les fichiers de `.agents/rules` sont exclus de
-l'empreinte de l'arbre, pour qu'un changement d'état ne périme pas l'évaluation. Une
-évaluation échouée est enregistrée et ne change pas l'état. `promote` exige une
-évaluation réussie et à jour de ce contenu exact, retire dans le même mouvement la
-règle remplacée si elle est active, et garde le verrou du journal du début à la fin :
-deux promotions concurrentes ne peuvent pas réussir toutes les deux. `rollback`
-remet chaque fichier modifié par la promotion octet pour octet, si personne ne l'a
-changé depuis. `compare` met côte à côte les mesures de deux règles (contrôles
-réussis, échecs, durée totale, péremption) et les octets qu'une règle active ajoute
-à `status` et `recall` ; il ne décide rien et ne promeut rien.
+**Règles.** Fichiers `.agents/rules/<id>.json` : `version`, `id` (le nom du fichier),
+`statement`, `scope`, `origin`, `refuted_by` (de un à huit contrôles de la liste
+autorisée), `replaces` facultatif, `state`. Tout autre champ, un lien, plus de 16 Kio :
+refusé, sans masquer les autres. Le texte d'une règle est une donnée. Une règle entre au
+journal par `head register`, toujours comme candidate : si le fichier dit plus (evaluated,
+active, retired, dans une copie fraîche du dépôt qui n'a pas de journal), `register` le
+remet à candidate dans le même mouvement enregistré ; l'affirmation n'est jamais crue et
+une nouvelle évaluation est nécessaire. Mouvements : candidate vers
+evaluated (évaluation certifiante), evaluated vers active (`promote`), active vers
+evaluated (`rollback`), vers retired (`retire`). Chaque mouvement est un événement `rule`
+écrit par l'outil avec les empreintes avant et après et le texte d'avant. `evaluate` lance
+les contrôles réfutants et n'est certifiante que si tous sont `passed` sur un même
+instantané. `promote` exige que la dernière évaluation certifie l'état actuel et la cite
+comme preuve ; la relecture vérifie que cette évaluation existe, précède la promotion, est
+la dernière de la règle, porte sur le même contenu et a réussi, sinon l'événement est
+écarté. Un mouvement qui modifie des fichiers enregistre d'abord son intention
+(`rule-transaction.json`) ; à l'ouverture suivante, l'outil l'achève (fichiers écrits,
+événement manquant) ou l'annule (il ne remet que les fichiers qu'il avait écrits) ; si un
+fichier est dans un troisième état, les écritures sont refusées jusqu'à ce qu'une personne
+décide. `rollback` remet les fichiers octet pour octet. `compare` rapporte et ne décide
+rien.
 
-**Ce que signifie active.** Une règle active est listée par `status` et `recall`
-(marquée données non fiables) pour qu'une personne ou un assistant qui commence un
-travail la lise. Rien ne consomme ni n'applique une règle automatiquement : active ne
-veut pas dire appliquée. Aucune règle ne peut élargir une permission : elle ne peut
-citer que des contrôles déjà autorisés.
+**Ce que signifie active.** Une règle active est listée par `status` et `recall`, marquée
+données non fiables, avec l'état de son évaluation : `active` si elle certifie encore
+l'état actuel, `active-stale` sinon. Rien ne consomme ni n'applique une règle : active ne
+veut pas dire appliquée. Une règle ne cite que des contrôles déjà autorisés.
 
-Règles livrées, tirées de l'histoire du projet : `date-proven-only-when-authenticated`
-(réfutée par `python-tests` ; le moteur Rust est hors de sa portée faute de test qui le
-réfute) et `tests-never-reach-network` (`python-tests` et `cargo-test`). Elles ont été
-évaluées avec les vrais contrôles sous WSL et laissées à l'état evaluated : la
-promotion revient au propriétaire.
+**Règles livrées.** `date-proven-only-when-authenticated` (réfutée par `python-tests`,
+qui sous WSL ne peut pas être confiné : elle reste candidate) et
+`tests-never-reach-network` (réfutée par `cargo-test`, qui exige l'isolation réseau :
+évaluée le 20 novembre dans le journal local de cette machine). Ni l'une ni l'autre n'est
+active : la promotion revient au propriétaire.
 
-Limites explicites : le journal en clair n'est pas infalsifiable (un fichier modifié à
-la main peut contenir un faux résultat de contrôle ou un faux mouvement de règle
-cohérent ; aucune chaîne de hachage) ; il ne doit contenir aucun secret, ce qui n'est
-pas contrôlé. Les règles sont indicatives tant que rien ne les consomme. Ce n'est pas
-un planificateur : rien ne propose, ne choisit ni ne lance un travail de lui-même.
-Pas encore d'index ni de cache ; pas de seuils de promotion chiffrés (`compare`
-rapporte, une personne décide). L'empreinte de l'arbre de travail couvre les fichiers
-suivis par Git (`git status` et `git diff HEAD`) ; d'un fichier non suivi, elle ne
-voit que le nom : modifier un fichier non suivi ne périme ni un résultat ni une
-évaluation tant qu'il n'est pas ajouté à Git.
-Sous Windows : pas d'ouverture sans suivi de lien (`O_NOFOLLOW`), donc les contrôles
-de lien et de taille d'une source se font avant l'ouverture et une course reste
-possible ; le nombre de liens physiques du journal n'est pas contrôlé ; au délai, seul
-le processus direct du contrôle est tué, pas ses descendants. Le binaire n'a pas été
-compilé ni testé sous Windows : validation Linux/WSL uniquement.
-Validation : 72 tests Rust passent (`cargo test --all-targets`), dont 33 pour la tête
-(15 dans `rust/src/head/tests.rs`, 18 dans `rust/tests/head_lifecycle.rs`). Les deux
-contrôles livrés ont été lancés par `head check` et `head evaluate` sous WSL sur ce
-dépôt et réussissent.
+### Modèle de confiance
+
+L'outil suppose que la personne qui le lance est celle qui décide : son compte, son
+dossier personnel, sa configuration de Cargo (`~/.cargo`) et le cache de l'outil sont à
+elle et ne sont écrits par personne d'autre. Il suppose que le dépôt qu'elle a déclaré de
+confiance, et sa liste de contrôles telle qu'elle l'a relue, contiennent ce qu'elle veut
+exécuter ; les règles d'exclusion de Git du dépôt décident de ce qui entre dans
+l'empreinte. Il suppose une machine saine : noyau, programmes du système (`/usr/bin/git`,
+`/usr/bin/cargo`) et WSL non compromis.
+
+Il défend contre : un dépôt non déclaré (y compris un sous-dossier avec un faux `.git`),
+une liste de contrôles modifiée après la confiance, l'environnement de l'appelant (PATH,
+HOME, CARGO_HOME), un programme ou une configuration d'exécution changés, une
+configuration Git qui lancerait un assistant, un arbre modifié pendant ou après un
+contrôle, un descendant qui fuit, une sortie tronquée, un accès réseau d'un contrôle qui
+exige l'isolation (Linux), une ligne de journal coupée, un mouvement interrompu, un texte
+de règle ou d'événement qui donnerait un ordre.
+
+Il ne défend pas contre : quelqu'un qui peut écrire dans le dossier du journal, la liste
+de confiance ou le cache (il peut forger le journal, une confiance ou un instantané) ; un
+programme hostile du même compte ; la configuration personnelle de la personne (les
+`.cargo/config.toml` des dossiers parents du cache sont lus par Cargo) ; un cache de
+compilation empoisonné par quelqu'un qui peut l'écrire (il est privé, 0700, à supprimer
+à la main en cas de doute : `~/.cache/empreinte/head/cargo-target`) ; ce que les tests
+d'un dépôt de confiance font de leur plein gré dans leur espace (fichiers temporaires,
+dossier personnel privé) ; Windows, où rien de ce confinement n'existe.
+
+Limites explicites : le journal en clair n'est pas infalsifiable. Les règles sont
+indicatives tant que rien ne les consomme. Ce n'est pas un planificateur. Pas d'index ni
+de cache de recherche ; pas de seuils de promotion chiffrés. Sous Windows, non compilé ni
+testé : pas d'`openat` (contrôles de lien par chemin, une course reste possible), pas
+d'identité de fichier pour le verrou, pas de confinement (il faudrait un Job Object avec
+`KILL_ON_JOB_CLOSE` pour les descendants et un AppContainer ou un pare-feu pour le réseau) :
+tout résultat y serait `incomplete` et rien n'y serait certifié. Les chemins de la
+confiance et du cache y viennent de l'environnement.
+Validation : 95 tests Rust passent sous WSL le 20 novembre (`cargo test --all-targets`), dont 54 pour la
+tête (19 dans `rust/src/head/tests.rs`, 20 dans `rust/tests/head_audit.rs`, 15 dans
+`rust/tests/head_lifecycle.rs`).
 
 ### Critères d'acceptation, état
 
-1. Reprise sans doubler une tâche ni annoncer un faux succès : fait (doublons refusés,
-   `verified` exige un contrôle réel ; tests `free_text_never_verifies`,
-   `a_passing_check_run_by_the_tool_verifies_and_goes_stale_when_checks_change`).
-2. Récupération déterministe, plafond UTF-8, chaque source citée : fait.
+1. Reprise sans doubler une tâche ni annoncer un faux succès : fait (`verified` exige un
+   contrôle `passed` sur l'arbre actuel).
+2. Récupération déterministe, plafond UTF-8, chaque source citée, état effectif : fait.
 3. Invalidation lorsque la source change : l'état `changed` est recalculé ; pas de cache.
-4. Événement mal formé rejeté, pas d'écriture concurrente : fait, et une ligne invalide
-   ne bloque plus le journal.
+4. Événement mal formé rejeté, pas d'écriture concurrente : fait ; une ligne invalide ne
+   bloque pas le journal et ne devient jamais valide.
 5. Proposition de règle incapable d'accorder un outil ou une permission : fait.
-6. Retour à une politique précédente sans perte de mémoire : fait pour les règles
-   (`promote_then_rollback_gives_back_identical_files_and_state`,
-   `the_journal_alone_rebuilds_every_state_and_mismatches_are_reported`). Il n'y a
-   pas d'index à reconstruire : la recherche relit le journal.
+6. Retour à une politique précédente sans perte de mémoire : fait pour les règles ; pas
+   d'index à reconstruire.
 
 Conformément aux notes de reprise, commencer par le harness de développement
 d'Empreinte : aider Claude et Codex à reprendre, choisir une prochaine tâche,

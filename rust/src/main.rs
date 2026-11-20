@@ -36,7 +36,8 @@ enum Command {
         /// Dossier du journal ; par défaut <dépôt>/.empreinte-head.
         #[arg(long)]
         memory: Option<PathBuf>,
-        /// Racine du dépôt ; par défaut le dépôt Git qui contient le dossier courant.
+        /// Racine du dépôt (de confiance) ; par défaut le dépôt de confiance qui contient
+        /// le dossier courant.
         #[arg(long)]
         repo: Option<PathBuf>,
         #[command(subcommand)]
@@ -67,6 +68,16 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum HeadCommand {
+    /// Montre ce que contient un dépôt ; avec --confirm, l'ajoute à la liste de confiance.
+    Trust {
+        path: PathBuf,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Fait entrer une règle du dépôt dans le journal, comme candidate.
+    Register {
+        rule: String,
+    },
     Status,
     Recall {
         query: String,
@@ -354,32 +365,37 @@ async fn main() -> Result<()> {
             action,
         } => {
             use empreinte::head;
-            let repo = match repo {
-                Some(path) => path.canonicalize()?,
-                None => head::find_repo(&std::env::current_dir()?)?,
-            };
-            let memory = memory.unwrap_or_else(|| repo.join(".empreinte-head"));
+            let settings = head::Settings::for_current_user()?;
+            if let HeadCommand::Trust { path, confirm } = &action {
+                let shown = head::trust::trust(&settings, path, *confirm)?;
+                println!("{}", serde_json::to_string_pretty(&shown)?);
+                return Ok(());
+            }
+            let ctx = head::trust::resolve(&settings, repo.as_deref(), &std::env::current_dir()?)?;
+            let memory = memory.unwrap_or_else(|| ctx.root.join(".empreinte-head"));
             let candidate = matches!(&action, HeadCommand::ProposeRule { .. });
             let result = match action {
-                HeadCommand::Check { task, name } => head::run_check(&memory, &repo, &task, &name)?,
-                HeadCommand::Checks => head::checks::load(&repo)?.describe(),
-                HeadCommand::Rules => head::rules::report(&head::Memory::open(&memory, &repo)?),
-                HeadCommand::Evaluate { rule } => head::rules::evaluate(&memory, &repo, &rule)?,
-                HeadCommand::Promote { rule } => head::rules::promote(&memory, &repo, &rule)?,
-                HeadCommand::Rollback { rule } => head::rules::rollback(&memory, &repo, &rule)?,
-                HeadCommand::Retire { rule } => head::rules::retire(&memory, &repo, &rule)?,
-                HeadCommand::Compare { a, b } => head::rules::compare(&memory, &repo, &a, &b)?,
-                HeadCommand::Repair => head::Memory::open(&memory, &repo)?.repair()?,
-                HeadCommand::Status => head::Memory::open(&memory, &repo)?.status(),
+                HeadCommand::Trust { .. } => unreachable!("handled above"),
+                HeadCommand::Register { rule } => head::rules::register(&memory, &ctx, &rule)?,
+                HeadCommand::Check { task, name } => head::run_check(&memory, &ctx, &task, &name)?,
+                HeadCommand::Checks => head::checks::load(&ctx)?.describe(),
+                HeadCommand::Rules => head::rules::report(&head::Memory::open(&memory, &ctx)?),
+                HeadCommand::Evaluate { rule } => head::rules::evaluate(&memory, &ctx, &rule)?,
+                HeadCommand::Promote { rule } => head::rules::promote(&memory, &ctx, &rule)?,
+                HeadCommand::Rollback { rule } => head::rules::rollback(&memory, &ctx, &rule)?,
+                HeadCommand::Retire { rule } => head::rules::retire(&memory, &ctx, &rule)?,
+                HeadCommand::Compare { a, b } => head::rules::compare(&memory, &ctx, &a, &b)?,
+                HeadCommand::Repair => head::Memory::open(&memory, &ctx)?.repair()?,
+                HeadCommand::Status => head::Memory::open(&memory, &ctx)?.status(),
                 HeadCommand::Recall { query, budget } => {
-                    head::Memory::open(&memory, &repo)?.recall(&query, budget)
+                    head::Memory::open(&memory, &ctx)?.recall(&query, budget)
                 }
                 HeadCommand::Record { file } | HeadCommand::ProposeRule { file } => {
                     let mut input = head::read_input(&file)?;
                     if candidate {
                         input.kind = "candidate".into();
                     }
-                    let mut journal = head::Memory::open(&memory, &repo)?;
+                    let mut journal = head::Memory::open(&memory, &ctx)?;
                     journal.record(input)?;
                     journal.status()
                 }

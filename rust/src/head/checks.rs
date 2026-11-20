@@ -1,65 +1,68 @@
 //! The evaluator: checks the developer allowed, run by the tool itself.
 //!
-//! What runs comes only from the versioned file `.agents/checks.json` of the repository:
-//! the program and its arguments (an argument vector, never a shell line), the working
-//! directory (inside the repository) and the timeout. The only thing taken from the
-//! command line is the check's name. No journal record, rule, recalled text or other
-//! argument can change the program, an argument, the directory or the environment: the
-//! child gets a cleared environment plus a fixed list of variables of the tool's own
-//! environment (`PASSTHROUGH`).
+//! What runs comes only from `.agents/checks.json` of a trusted repository, as it was when
+//! trust was given (see trust.rs): the program, named by an absolute path (a bare or
+//! relative name is refused, so no search path is ever consulted), its arguments (an
+//! argument vector, never a shell line), the working directory (inside the snapshot) and
+//! the timeout. The only thing taken from the command line is the check's name.
 //!
-//! A result records the exit status, the duration, a digest of the output (never the
-//! output itself), the digest of the checks file and the repository revision (git HEAD,
-//! whether the tree was dirty, and a digest of `git status` and `git diff HEAD`), so it
-//! can later be recognised as stale.
-use anyhow::{Context, Result, anyhow, bail, ensure};
+//! The environment is built from fixed values, never inherited: PATH, HOME (a private
+//! directory of the tool's cache), CARGO_HOME and RUSTUP_HOME (the account's own, from the
+//! account database), LANG and PYTHONDONTWRITEBYTECODE, plus the variables the check's entry
+//! lists with their values (`@cache` and `@home` stand for the tool's cache directory and
+//! the account's home). Each result records the program's path and the SHA-256 of its
+//! content, and the SHA-256 of the whole execution configuration (program, arguments,
+//! directory, environment, bounds, isolation, Cargo's configuration files under
+//! CARGO_HOME); a change in either makes the result stale.
+//!
+//! A check runs contained (see contain.rs) in a read-only snapshot of the repository's
+//! inputs (see tree.rs). Its outcome is "passed" only if it exited with 0 within its time,
+//! its output was captured completely within its bound, containment and cleanup were
+//! confirmed, the network was isolated when the check requires it, and the snapshot was
+//! left intact. A genuine non-zero exit under those conditions is "failed"; anything else
+//! is "incomplete". Only a "passed" result can certify anything.
+use super::contain::{self, RunSpec};
+use super::tree;
+use super::trust::{Context, private_dir};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub const CHECKS_FILE: &str = ".agents/checks.json";
 pub const MAX_CHECKS_FILE_BYTES: u64 = 64 * 1024;
-pub const DEFAULT_OUTPUT_BYTES: u64 = 64 * 1024;
+pub const DEFAULT_OUTPUT_BYTES: u64 = 1024 * 1024;
 const MAX_TIMEOUT_SECS: u64 = 7200;
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
-const GIT_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Variables of the tool's own environment that a check inherits; nothing else.
-pub const PASSTHROUGH: &[&str] = &[
-    "PATH",
-    "PATHEXT",
-    "HOME",
-    "USER",
-    "LANG",
-    "LC_ALL",
-    "TMPDIR",
-    "TEMP",
-    "TMP",
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "USERPROFILE",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "PROGRAMDATA",
-    "CARGO_HOME",
-    "RUSTUP_HOME",
-    "CARGO_TARGET_DIR",
-    "WSL_DISTRO_NAME",
-    "WSL_INTEROP",
-    "WSLENV",
-];
+const MAX_PROGRAM_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChecksFile {
     version: u32,
+    git: Platformed<String>,
     checks: BTreeMap<String, CheckSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Platformed<T> {
+    #[serde(default)]
+    pub unix: Option<T>,
+    #[serde(default)]
+    pub windows: Option<T>,
+}
+
+impl<T> Platformed<T> {
+    fn current(&self) -> Option<&T> {
+        if cfg!(windows) {
+            self.windows.as_ref()
+        } else {
+            self.unix.as_ref()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,27 +70,28 @@ struct ChecksFile {
 pub struct CheckSpec {
     #[serde(default)]
     pub description: String,
-    pub command: Commands,
+    pub command: Platformed<Vec<String>>,
     #[serde(default = "dot")]
     pub cwd: String,
     pub timeout_secs: u64,
     #[serde(default)]
     pub max_output_bytes: Option<u64>,
+    /// Extra environment variables, with their values (no inheritance).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// The result cannot pass unless the network was isolated.
+    #[serde(default)]
+    pub requires_isolation: bool,
+    /// Run without containment (e.g. a Windows program reached through WSL): its result is
+    /// always "incomplete" and certifies nothing.
+    #[serde(default)]
+    pub uncontained: bool,
 }
 fn dot() -> String {
     ".".into()
 }
 
-/// One argument vector per platform; a platform without one cannot run the check.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Commands {
-    #[serde(default)]
-    pub unix: Option<Vec<String>>,
-    #[serde(default)]
-    pub windows: Option<Vec<String>>,
-}
-
+/// Kept for results written before snapshots existed (then `head` and `dirty` came from git).
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Revision {
@@ -96,10 +100,29 @@ pub struct Revision {
     pub tree_sha256: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecInfo {
+    pub program: String,
+    pub program_sha256: String,
+    pub config_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Isolation {
+    pub contained: bool,
+    pub network_isolated: bool,
+    pub cleanup_confirmed: bool,
+    pub capture_complete: bool,
+    pub requires_isolation: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckResult {
     pub name: String,
+    /// True only when `outcome` is "passed".
     pub passed: bool,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
@@ -107,15 +130,28 @@ pub struct CheckResult {
     /// SHA-256 of "stdout:" + hex SHA-256(stdout) + "\nstderr:" + hex SHA-256(stderr).
     pub output_sha256: String,
     pub output_bytes: u64,
-    /// The output was longer than the check's bound: only its digest covers all of it.
     pub output_truncated: bool,
     pub checks_sha256: String,
     pub revision: Revision,
     pub platform: String,
+    /// passed, failed or incomplete (absent in results written before snapshots).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Digest of the snapshot the check ran in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<ExecInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<Isolation>,
+    /// Why the outcome is not "passed", when it is not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
 }
 
 pub struct Checks {
     pub sha256: String,
+    git: Platformed<String>,
     specs: BTreeMap<String, CheckSpec>,
 }
 
@@ -131,56 +167,66 @@ pub fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
-fn read_checks_file(repo: &Path) -> Result<Vec<u8>> {
-    let path = repo.join(CHECKS_FILE);
-    let meta = std::fs::symlink_metadata(&path)
-        .with_context(|| format!("fichier de contrôles absent : {CHECKS_FILE}"))?;
-    ensure!(
-        meta.is_file() && !meta.file_type().is_symlink(),
-        "{CHECKS_FILE} doit être un fichier ordinaire"
-    );
-    let mut bytes = Vec::new();
-    std::fs::File::open(&path)?
-        .take(MAX_CHECKS_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_CHECKS_FILE_BYTES,
-        "{CHECKS_FILE} dépasse 64 Kio"
-    );
-    Ok(bytes)
+/// An absolute path in the syntax of the platform it is written for: "/..." for Unix,
+/// "C:\..." or "C:/..." for Windows (checked as text, whatever platform reads the file).
+fn absolute_program(program: &str, windows: bool) -> bool {
+    let bytes = program.as_bytes();
+    let absolute = if windows {
+        bytes.len() > 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\')
+    } else {
+        program.starts_with('/')
+    };
+    absolute && !program.contains('\0') && program.len() <= 1000
 }
 
-/// Digest of the checks file as it is now (None when it cannot be read).
-pub fn current_hash(repo: &Path) -> Option<String> {
-    read_checks_file(repo).ok().map(|b| sha256_hex(&b))
-}
-
-pub fn load(repo: &Path) -> Result<Checks> {
-    let bytes = read_checks_file(repo)?;
+/// Parse and validate an allow-list (`root` is where working directories are checked).
+pub fn parse(bytes: &[u8], root: &Path) -> Result<Checks> {
     let file: ChecksFile =
-        serde_json::from_slice(&bytes).with_context(|| format!("{CHECKS_FILE} illisible"))?;
-    ensure!(file.version == 1, "{CHECKS_FILE} : version 1 attendue");
+        serde_json::from_slice(bytes).with_context(|| format!("{CHECKS_FILE} illisible"))?;
+    ensure!(
+        file.version == 2,
+        "{CHECKS_FILE} : version 2 attendue (programmes en chemin absolu)"
+    );
+    for (program, windows) in [(&file.git.unix, false), (&file.git.windows, true)] {
+        if let Some(program) = program {
+            ensure!(
+                absolute_program(program, windows),
+                "{CHECKS_FILE} : git doit être un chemin absolu"
+            );
+        }
+    }
     for (name, spec) in &file.checks {
         ensure!(valid_name(name), "nom de contrôle invalide : {name}");
-        validate_spec(repo, name, spec)?;
+        validate_spec(root, name, spec)?;
     }
     Ok(Checks {
-        sha256: sha256_hex(&bytes),
+        sha256: sha256_hex(bytes),
+        git: file.git,
         specs: file.checks,
     })
 }
 
-fn validate_spec(repo: &Path, name: &str, spec: &CheckSpec) -> Result<()> {
-    for argv in [&spec.command.unix, &spec.command.windows]
-        .into_iter()
-        .flatten()
-    {
+/// The trusted repository's allow-list (refused if it changed since trust was given).
+pub fn load(ctx: &Context) -> Result<Checks> {
+    parse(&ctx.checks_bytes()?, &ctx.root)
+}
+
+fn validate_spec(root: &Path, name: &str, spec: &CheckSpec) -> Result<()> {
+    for (argv, windows) in [(&spec.command.unix, false), (&spec.command.windows, true)] {
+        let Some(argv) = argv else { continue };
         ensure!(
             !argv.is_empty()
                 && argv.len() <= 64
-                && argv.iter().all(|a| a.len() <= 1000 && !a.contains('\0'))
-                && !argv[0].is_empty(),
+                && argv.iter().all(|a| a.len() <= 1000 && !a.contains('\0')),
             "contrôle {name} : commande invalide"
+        );
+        ensure!(
+            absolute_program(&argv[0], windows),
+            "contrôle {name} : le programme doit être nommé par un chemin absolu, pas « {} »",
+            argv[0]
         );
     }
     ensure!(
@@ -192,34 +238,47 @@ fn validate_spec(repo: &Path, name: &str, spec: &CheckSpec) -> Result<()> {
             .is_none_or(|n| (1..=MAX_OUTPUT_BYTES).contains(&n)),
         "contrôle {name} : borne de sortie invalide"
     );
-    working_dir(repo, &spec.cwd).with_context(|| format!("contrôle {name}"))?;
+    for (key, value) in &spec.env {
+        ensure!(
+            !key.is_empty()
+                && key.len() <= 64
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                && value.len() <= 4000
+                && !value.contains('\0'),
+            "contrôle {name} : variable d'environnement invalide {key}"
+        );
+    }
+    ensure!(
+        !(spec.requires_isolation && spec.uncontained),
+        "contrôle {name} : une isolation exigée ne peut pas être lancée sans confinement"
+    );
+    relative_dir(&spec.cwd).with_context(|| format!("contrôle {name}"))?;
+    let _ = root;
     Ok(())
 }
 
-/// The working directory, resolved (links followed) and required to be inside the repository.
-fn working_dir(repo: &Path, cwd: &str) -> Result<PathBuf> {
+/// A working directory: relative, inside the repository (no root, no "..").
+fn relative_dir(cwd: &str) -> Result<PathBuf> {
     let relative = Path::new(cwd);
     ensure!(
         !relative.is_absolute()
-            && !relative
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            && relative.components().all(|c| matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )),
         "répertoire de travail : chemin relatif au dépôt requis"
     );
-    let resolved = repo
-        .join(relative)
-        .canonicalize()
-        .context("répertoire de travail introuvable")?;
-    ensure!(
-        resolved.starts_with(repo) && resolved.is_dir(),
-        "répertoire de travail hors du dépôt"
-    );
-    Ok(resolved)
+    Ok(relative.to_path_buf())
 }
 
 impl Checks {
     pub fn names(&self) -> Vec<&str> {
         self.specs.keys().map(String::as_str).collect()
+    }
+    pub fn git_program(&self) -> Option<PathBuf> {
+        self.git.current().map(PathBuf::from)
     }
     pub fn describe(&self) -> serde_json::Value {
         serde_json::json!(
@@ -229,9 +288,12 @@ impl Checks {
                     n.clone(),
                     serde_json::json!({
                         "description": s.description,
+                        "command": s.command.current(),
                         "cwd": s.cwd,
                         "timeout_secs": s.timeout_secs,
-                        "platform": argv_for_platform(s).is_some(),
+                        "env": s.env,
+                        "requires_isolation": s.requires_isolation,
+                        "uncontained": s.uncontained,
                     })
                 ))
                 .collect::<BTreeMap<_, _>>()
@@ -245,296 +307,347 @@ impl Checks {
     }
 }
 
-fn argv_for_platform(spec: &CheckSpec) -> Option<&Vec<String>> {
-    if cfg!(windows) {
-        spec.command.windows.as_ref()
-    } else {
-        spec.command.unix.as_ref()
-    }
-}
-
 pub fn platform() -> &'static str {
     if cfg!(windows) { "windows" } else { "unix" }
 }
 
+fn expand(value: &str, ctx: &Context) -> Result<String> {
+    Ok(value
+        .replace("@cache", &ctx.settings.cache()?.display().to_string())
+        .replace("@home", &ctx.settings.user_home.display().to_string()))
+}
+
+/// The environment of a check: fixed values, then the entry's own (see module documentation).
+pub fn environment(ctx: &Context, spec: &CheckSpec) -> Result<Vec<(String, String)>> {
+    let home = ctx.settings.cache()?.join("home");
+    private_dir(&home)?;
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+    let user = &ctx.settings.user_home;
+    if cfg!(windows) {
+        env.insert("PATH".into(), "C:\\Windows\\System32;C:\\Windows".into());
+        env.insert("SYSTEMROOT".into(), "C:\\Windows".into());
+        env.insert("USERPROFILE".into(), home.display().to_string());
+    } else {
+        env.insert("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into());
+    }
+    env.insert("HOME".into(), home.display().to_string());
+    env.insert(
+        "CARGO_HOME".into(),
+        user.join(".cargo").display().to_string(),
+    );
+    env.insert(
+        "RUSTUP_HOME".into(),
+        user.join(".rustup").display().to_string(),
+    );
+    env.insert("LANG".into(), "C.UTF-8".into());
+    env.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
+    for (key, value) in &spec.env {
+        env.insert(key.clone(), expand(value, ctx)?);
+    }
+    Ok(env.into_iter().collect())
+}
+
+fn file_digest(path: &Path, limit: u64) -> Result<String> {
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("{} introuvable", path.display()))?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "{} : fichier ordinaire requis",
+        path.display()
+    );
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 16];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        ensure!(total <= limit, "{} : trop grand", path.display());
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Program and execution configuration of a check as they are now.
+pub fn exec_info(ctx: &Context, checks: &Checks, name: &str) -> Result<ExecInfo> {
+    let spec = checks.get(name)?;
+    let argv = spec
+        .command
+        .current()
+        .ok_or_else(|| anyhow!("contrôle {name} : aucune commande pour {}", platform()))?;
+    let program = PathBuf::from(&argv[0]);
+    let program_sha256 = file_digest(&program, MAX_PROGRAM_BYTES)?;
+    let env = environment(ctx, spec)?;
+    let cargo_home = env
+        .iter()
+        .find(|(k, _)| k == "CARGO_HOME")
+        .map(|(_, v)| PathBuf::from(v));
+    let mut cargo_config = BTreeMap::new();
+    if let Some(home) = cargo_home {
+        for name in ["config.toml", "config"] {
+            let path = home.join(name);
+            let state = match std::fs::symlink_metadata(&path) {
+                Ok(_) => file_digest(&path, MAX_CHECKS_FILE_BYTES * 16)?,
+                Err(_) => "absent".to_string(),
+            };
+            cargo_config.insert(path.display().to_string(), state);
+        }
+    }
+    let config = serde_json::json!({
+        "argv": argv,
+        "cwd": spec.cwd,
+        "env": env,
+        "timeout_secs": spec.timeout_secs,
+        "max_output_bytes": spec.max_output_bytes.unwrap_or(DEFAULT_OUTPUT_BYTES),
+        "requires_isolation": spec.requires_isolation,
+        "uncontained": spec.uncontained,
+        "cargo_config": cargo_config,
+        "platform": platform(),
+    });
+    Ok(ExecInfo {
+        program: program.display().to_string(),
+        program_sha256,
+        config_sha256: sha256_hex(&serde_json::to_vec(&config)?),
+    })
+}
+
 /// Run the named check of `checks`. Only `name` comes from the caller.
-pub fn run(repo: &Path, checks: &Checks, name: &str) -> Result<CheckResult> {
-    run_with_tail(repo, checks, name).map(|(result, _)| result)
+pub fn run(ctx: &Context, checks: &Checks, name: &str) -> Result<CheckResult> {
+    run_with_tail(ctx, checks, name).map(|(result, _)| result)
+}
+
+fn incomplete(name: &str, checks: &Checks, exec: Option<ExecInfo>, problem: String) -> CheckResult {
+    CheckResult {
+        name: name.into(),
+        passed: false,
+        exit_code: None,
+        timed_out: false,
+        duration_ms: 0,
+        output_sha256: sha256_hex(b""),
+        output_bytes: 0,
+        output_truncated: false,
+        checks_sha256: checks.sha256.clone(),
+        revision: Revision {
+            head: None,
+            dirty: None,
+            tree_sha256: None,
+        },
+        platform: platform().into(),
+        outcome: Some("incomplete".into()),
+        snapshot_sha256: None,
+        exec,
+        isolation: None,
+        problems: vec![problem],
+    }
 }
 
 /// As `run`, plus the end of the output (at most 4000 bytes) for the person who ran it.
 /// The tail is shown on the command line only; the journal keeps its digest, never text.
-pub fn run_with_tail(repo: &Path, checks: &Checks, name: &str) -> Result<(CheckResult, String)> {
-    let spec = checks.get(name)?;
-    let argv = argv_for_platform(spec)
-        .ok_or_else(|| anyhow!("contrôle {name} : aucune commande pour {}", platform()))?;
-    let cwd = working_dir(repo, &spec.cwd)?;
+pub fn run_with_tail(ctx: &Context, checks: &Checks, name: &str) -> Result<(CheckResult, String)> {
+    let spec = checks.get(name)?.clone();
+    let argv = spec
+        .command
+        .current()
+        .ok_or_else(|| anyhow!("contrôle {name} : aucune commande pour {}", platform()))?
+        .clone();
+    let exec = exec_info(ctx, checks, name)?;
+    let snapshot = match tree::snapshot(ctx, checks) {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok((
+                incomplete(
+                    name,
+                    checks,
+                    Some(exec),
+                    format!("empreinte ou instantané impossible : {e:#}"),
+                ),
+                String::new(),
+            ));
+        }
+    };
+    let cwd = snapshot.tree.join(relative_dir(&spec.cwd)?);
+    if !cwd.is_dir() {
+        return Ok((
+            incomplete(
+                name,
+                checks,
+                Some(exec),
+                format!(
+                    "répertoire de travail absent de l'instantané : {}",
+                    spec.cwd
+                ),
+            ),
+            String::new(),
+        ));
+    }
     let limit = spec.max_output_bytes.unwrap_or(DEFAULT_OUTPUT_BYTES);
-    let revision = revision(repo);
-    let mut command = Command::new(&argv[0]);
-    command.args(&argv[1..]).current_dir(&cwd);
+    let run_spec = RunSpec {
+        program: PathBuf::from(&argv[0]),
+        args: argv[1..].to_vec(),
+        cwd,
+        env: environment(ctx, &spec)?,
+        timeout: Duration::from_secs(spec.timeout_secs),
+        max_output: limit,
+        contain: !spec.uncontained,
+        keep_stdout: false,
+    };
     let started = Instant::now();
-    let outcome = run_bounded(command, Duration::from_secs(spec.timeout_secs), limit)
-        .with_context(|| format!("contrôle {name} : lancement impossible"))?;
-    let start = outcome.tail.len().saturating_sub(4000);
-    let tail = String::from_utf8_lossy(&outcome.tail[start..]).into_owned();
+    let outcome = match contain::run(&run_spec) {
+        Ok(o) => o,
+        Err(e) => contain::error_outcome(format!("lancement impossible : {e}")),
+    };
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let mut problems = outcome.problems.clone();
+    let intact = snapshot.intact().unwrap_or(false);
+    if !intact {
+        problems.push("le contrôle a modifié l'instantané".into());
+    }
+    if spec.requires_isolation && !outcome.network_isolated {
+        problems.push("isolation réseau exigée mais non obtenue".into());
+    }
+    let finished = outcome.contained
+        && outcome.cleanup_confirmed
+        && outcome.capture_complete
+        && intact
+        && (!spec.requires_isolation || outcome.network_isolated);
+    let verdict = if !finished {
+        "incomplete"
+    } else if outcome.exit_code == Some(0) && !outcome.timed_out {
+        "passed"
+    } else {
+        if outcome.timed_out {
+            problems.push("délai dépassé".into());
+        }
+        "failed"
+    };
+    let tail = String::from_utf8_lossy(&outcome.tail).into_owned();
     let result = CheckResult {
         name: name.into(),
-        passed: !outcome.timed_out && outcome.exit_code == Some(0),
+        passed: verdict == "passed",
         exit_code: outcome.exit_code,
         timed_out: outcome.timed_out,
-        duration_ms: started.elapsed().as_millis() as u64,
-        output_sha256: outcome.output_sha256,
+        duration_ms,
+        output_sha256: outcome.output_sha256.clone(),
         output_bytes: outcome.output_bytes,
         output_truncated: outcome.output_bytes > limit,
         checks_sha256: checks.sha256.clone(),
-        revision,
+        revision: Revision {
+            head: None,
+            dirty: None,
+            tree_sha256: Some(snapshot.digest.sha256.clone()),
+        },
         platform: platform().into(),
+        outcome: Some(verdict.into()),
+        snapshot_sha256: Some(snapshot.digest.sha256.clone()),
+        exec: Some(exec),
+        isolation: Some(Isolation {
+            contained: outcome.contained,
+            network_isolated: outcome.network_isolated,
+            cleanup_confirmed: outcome.cleanup_confirmed,
+            capture_complete: outcome.capture_complete,
+            requires_isolation: spec.requires_isolation,
+        }),
+        problems,
     };
     Ok((result, tail))
 }
 
-pub struct Outcome {
-    pub exit_code: Option<i32>,
-    pub timed_out: bool,
-    pub output_sha256: String,
-    pub output_bytes: u64,
-    /// The last bytes of stdout then stderr, for display only (never written to the journal).
-    pub tail: Vec<u8>,
+/// What the repository looks like now, computed at most once per command.
+pub struct Now<'a> {
+    ctx: &'a Context,
+    checks: Option<Result<Checks>>,
+    tree: Option<Result<tree::TreeDigest, String>>,
+    exec: BTreeMap<String, Result<ExecInfo, String>>,
 }
 
-/// Spawn with a cleared environment (plus PASSTHROUGH), no stdin, both outputs drained
-/// and hashed. At the deadline the whole process group is killed (Unix); on Windows only
-/// the direct child can be killed with the standard library.
-pub fn run_bounded(mut command: Command, timeout: Duration, keep: u64) -> Result<Outcome> {
-    command.env_clear();
-    for name in PASSTHROUGH {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
+impl<'a> Now<'a> {
+    pub fn new(ctx: &'a Context) -> Self {
+        Self {
+            ctx,
+            checks: None,
+            tree: None,
+            exec: BTreeMap::new(),
         }
     }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
+    fn checks(&mut self) -> Result<&Checks, String> {
+        let ctx = self.ctx;
+        self.checks
+            .get_or_insert_with(|| load(ctx))
+            .as_ref()
+            .map_err(|e| format!("{e:#}"))
     }
-    let mut child = command.spawn()?;
-    let (tx, rx) = mpsc::channel();
-    let readers = [
-        child
-            .stdout
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-        child
-            .stderr
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    ];
-    for (index, reader) in readers.into_iter().enumerate() {
-        let tx = tx.clone();
-        let mut reader = reader.expect("piped");
-        std::thread::spawn(move || {
-            let mut hasher = Sha256::new();
-            let mut tail: Vec<u8> = Vec::new();
-            let mut total = 0u64;
-            let mut buffer = [0u8; 8192];
-            while let Ok(n) = reader.read(&mut buffer) {
-                if n == 0 {
-                    break;
+    pub fn checks_sha256(&mut self) -> Option<String> {
+        self.checks().ok().map(|c| c.sha256.clone())
+    }
+    pub fn tree(&mut self) -> Result<String, String> {
+        if self.tree.is_none() {
+            let value = match self.checks() {
+                Ok(_) => {
+                    let checks = self.checks.as_ref().unwrap().as_ref().unwrap();
+                    tree::digest(self.ctx, checks).map_err(|e| format!("{e:#}"))
                 }
-                hasher.update(&buffer[..n]);
-                total += n as u64;
-                tail.extend_from_slice(&buffer[..n]);
-                if tail.len() as u64 > keep {
-                    let cut = tail.len() - keep as usize;
-                    tail.drain(..cut);
+                Err(e) => Err(e),
+            };
+            self.tree = Some(value);
+        }
+        self.tree
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .map(|d| d.sha256.clone())
+            .map_err(Clone::clone)
+    }
+    pub fn exec(&mut self, name: &str) -> Result<ExecInfo, String> {
+        if !self.exec.contains_key(name) {
+            let value = match self.checks() {
+                Ok(_) => {
+                    let checks = self.checks.as_ref().unwrap().as_ref().unwrap();
+                    exec_info(self.ctx, checks, name).map_err(|e| format!("{e:#}"))
                 }
-            }
-            let _ = tx.send((index, hex::encode(hasher.finalize()), total, tail));
-        });
-    }
-    drop(tx);
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+                Err(e) => Err(e),
+            };
+            self.exec.insert(name.to_string(), value);
         }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            kill_tree(&mut child);
-            break child.wait()?;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    // Members of the group still alive after the leader exited would keep the pipes open.
-    kill_group(&child);
-    let mut streams: [(String, u64, Vec<u8>); 2] = Default::default();
-    let mut complete = true;
-    for _ in 0..2 {
-        match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok((index, digest, total, tail)) => streams[index] = (digest, total, tail),
-            Err(_) => complete = false,
-        }
-    }
-    let combined = format!(
-        "stdout:{}\nstderr:{}{}",
-        streams[0].0,
-        streams[1].0,
-        if complete { "" } else { "\nincomplete" }
-    );
-    let mut tail = std::mem::take(&mut streams[0].2);
-    tail.extend_from_slice(&streams[1].2);
-    Ok(Outcome {
-        exit_code: status.code(),
-        timed_out,
-        output_sha256: sha256_hex(combined.as_bytes()),
-        output_bytes: streams[0].1 + streams[1].1,
-        tail,
-    })
-}
-
-fn kill_tree(child: &mut Child) {
-    kill_group(child);
-    let _ = child.kill();
-}
-
-#[cfg(unix)]
-fn kill_group(child: &Child) {
-    // The child leads its own process group (process_group(0)): signal the whole group.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
-}
-#[cfg(not(unix))]
-fn kill_group(_child: &Child) {
-    // Without a job object (not available through the standard library) grandchildren
-    // of a check may survive its timeout on Windows. Documented in THINKING_HEAD.md.
-}
-
-fn git(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let mut command = Command::new("git");
-    command
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(repo)
-        .args(args);
-    let mut output = Vec::new();
-    // Same bounded runner, so a stuck git cannot hang the tool; output kept whole up to 16 Mio.
-    let outcome = run_capture(command, GIT_TIMEOUT, &mut output).ok()?;
-    (outcome == Some(0)).then_some(output)
-}
-
-fn run_capture(mut command: Command, timeout: Duration, out: &mut Vec<u8>) -> Result<Option<i32>> {
-    command.env_clear();
-    for name in PASSTHROUGH {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = command.spawn()?;
-    let mut stdout = child.stdout.take().ok_or_else(|| anyhow!("stdout"))?;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = (&mut stdout).take(MAX_OUTPUT_BYTES).read_to_end(&mut bytes);
-        let _ = tx.send(bytes);
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            child.wait()?;
-            bail!("délai dépassé");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    *out = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
-    Ok(status.code())
-}
-
-/// The repository revision now: HEAD, dirty or not, and a digest of what is uncommitted.
-/// Fields are None when git is unavailable.
-pub fn revision(repo: &Path) -> Revision {
-    let head = git(repo, &["rev-parse", "HEAD"])
-        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
-        .filter(|h| !h.is_empty());
-    // Rule files are excluded: changing a rule's state must not make the code look changed
-    // (a rule's own content is tracked by its own digest, see rules.rs).
-    let status = git(
-        repo,
-        &[
-            "status",
-            "--porcelain",
-            "--",
-            ".",
-            ":(exclude).agents/rules",
-        ],
-    );
-    let diff = git(
-        repo,
-        &[
-            "diff",
-            "HEAD",
-            "--no-ext-diff",
-            "--no-color",
-            "--",
-            ".",
-            ":(exclude).agents/rules",
-        ],
-    );
-    let dirty = status.as_ref().map(|s| !s.is_empty());
-    let tree_sha256 = match (&status, &diff) {
-        (Some(s), Some(d)) => {
-            let mut h = Sha256::new();
-            h.update(b"status\0");
-            h.update(s);
-            h.update(b"\0diff\0");
-            h.update(d);
-            Some(hex::encode(h.finalize()))
-        }
-        _ => None,
-    };
-    Revision {
-        head,
-        dirty,
-        tree_sha256,
+        self.exec[name].clone()
     }
 }
 
-/// Why a result no longer describes the repository (empty: still current).
-pub fn stale_reasons(
-    result: &CheckResult,
-    checks_now: Option<&str>,
-    now: &Revision,
-) -> Vec<String> {
+/// Why a result does not certify the repository as it is now (empty: it does).
+pub fn certify(result: &CheckResult, now: &mut Now) -> Vec<String> {
     let mut reasons = Vec::new();
-    if checks_now != Some(result.checks_sha256.as_str()) {
-        reasons.push("le fichier de contrôles a changé depuis ce résultat".to_string());
-    }
-    if let Some(head) = &result.revision.head
-        && now.head.as_ref() != Some(head)
-    {
-        reasons.push("la révision du dépôt a changé".to_string());
-    }
-    if let Some(tree) = &result.revision.tree_sha256
-        && now.tree_sha256.as_ref() != Some(tree)
-    {
-        reasons.push("l'arbre de travail a changé".to_string());
+    let Some(snapshot) = &result.snapshot_sha256 else {
+        return vec!["résultat d'avant les instantanés : relancer le contrôle".into()];
+    };
+    if result.outcome.as_deref() != Some("passed") {
+        reasons.push(format!(
+            "résultat {}",
+            result.outcome.as_deref().unwrap_or("inconnu")
+        ));
     }
     if result.platform != platform() {
         reasons.push(format!("résultat obtenu sous {}", result.platform));
+    }
+    match now.checks_sha256() {
+        Some(h) if h == result.checks_sha256 => {}
+        Some(_) => reasons.push("la liste des contrôles a changé depuis ce résultat".into()),
+        None => reasons.push("liste des contrôles illisible".into()),
+    }
+    match (now.exec(&result.name), &result.exec) {
+        (Ok(current), Some(recorded)) if &current == recorded => {}
+        (Ok(current), Some(recorded)) if current.program_sha256 != recorded.program_sha256 => {
+            reasons.push("le programme du contrôle a changé".into())
+        }
+        (Ok(_), Some(_)) => reasons.push("la configuration d'exécution a changé".into()),
+        (Ok(_), None) => reasons.push("résultat sans empreinte d'exécution".into()),
+        (Err(e), _) => reasons.push(format!("configuration d'exécution illisible : {e}")),
+    }
+    match now.tree() {
+        Ok(tree) if &tree == snapshot => {}
+        Ok(_) => reasons.push("l'arbre de travail diffère de l'instantané contrôlé".into()),
+        Err(e) => reasons.push(format!("empreinte de l'arbre de travail impossible : {e}")),
     }
     reasons
 }

@@ -1,25 +1,33 @@
 {
-  "version": 1,
+  "version": 2,
+  "git": {
+    "unix": "/usr/bin/git",
+    "windows": "C:/Program Files/Git/cmd/git.exe"
+  },
   "checks": {
     "cargo-test": {
-      "description": "Tests Rust du crate, hors ligne (--offline --locked) : aucun téléchargement. Les tests utilisent des dossiers temporaires et des données synthétiques.",
+      "description": "Tests Rust du crate, lancés par le cargo du système, sans téléchargement (--offline --locked), dans un instantané en lecture seule, sous Linux dans un espace de noms réseau vide : le contrôle exige cette isolation. Le cache de compilation est dans le dossier de cache de l'outil.",
       "command": {
-        "unix": ["cargo", "test", "--offline", "--locked", "--manifest-path", "rust/Cargo.toml", "--all-targets"],
-        "windows": ["cargo", "test", "--offline", "--locked", "--manifest-path", "rust/Cargo.toml", "--all-targets"]
+        "unix": ["/usr/bin/cargo", "test", "--offline", "--locked", "--manifest-path", "rust/Cargo.toml", "--all-targets"]
       },
       "cwd": ".",
       "timeout_secs": 1800,
-      "max_output_bytes": 65536
+      "max_output_bytes": 1048576,
+      "env": {
+        "CARGO_TARGET_DIR": "@cache/cargo-target"
+      },
+      "requires_isolation": true
     },
     "python-tests": {
-      "description": "Suite Python (pytest, avec les tests Node). tests/conftest.py interdit tout accès réseau ; les coffres de test sont créés dans des dossiers temporaires, jamais dans le coffre personnel ou le coffre d'essai. Sous WSL, lance le Python Windows de l'environnement par l'interopérabilité.",
+      "description": "Suite Python (pytest, avec les tests Node). tests/conftest.py y bloque urllib, ce qui n'est pas une isolation réseau. Sous WSL, c'est le Python Windows de l'environnement, lancé par l'interopérabilité : il ne peut pas être confiné, son résultat est donc toujours incomplet et ne certifie rien.",
       "command": {
         "unix": ["/mnt/c/Users/sawle/.venvs/empreinte/Scripts/python.exe", "-m", "pytest", "-q", "-p", "no:cacheprovider"],
         "windows": ["C:/Users/sawle/.venvs/empreinte/Scripts/python.exe", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
       },
       "cwd": ".",
       "timeout_secs": 900,
-      "max_output_bytes": 65536
+      "max_output_bytes": 1048576,
+      "uncontained": true
     }
   }
 }
